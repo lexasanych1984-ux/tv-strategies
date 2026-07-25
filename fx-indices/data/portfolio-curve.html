@@ -1,0 +1,232 @@
+<title>Asia Sweep: портфель GER40 + NAS100 — помесячная кривая</title>
+<style>
+:root{
+  --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
+  --s-port:#2a78d6; --s-ger:#1baf7a; --s-nas:#eda100; --neg:#e34948; --pos:#2a78d6;
+  --good:#006300;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --page:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+    --s-port:#3987e5; --s-ger:#199e70; --s-nas:#c98500; --neg:#e66767; --pos:#3987e5;
+    --good:#0ca30c;
+  }
+}
+:root[data-theme="light"]{
+  --page:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --axis:#c3c2b7; --border:rgba(11,11,11,.10);
+  --s-port:#2a78d6; --s-ger:#1baf7a; --s-nas:#eda100; --neg:#e34948; --pos:#2a78d6;
+  --good:#006300;
+}
+:root[data-theme="dark"]{
+  --page:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#898781;
+  --grid:#2c2c2a; --axis:#383835; --border:rgba(255,255,255,.10);
+  --s-port:#3987e5; --s-ger:#199e70; --s-nas:#c98500; --neg:#e66767; --pos:#3987e5;
+  --good:#0ca30c;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--ink);
+  font:15px/1.55 "Segoe UI",system-ui,-apple-system,sans-serif;}
+.wrap{max-width:1020px;margin:0 auto;padding:32px 20px 64px;display:flex;flex-direction:column;gap:28px}
+header h1{font-family:Georgia,"Times New Roman",serif;font-weight:400;font-size:30px;line-height:1.2;margin:0 0 6px;text-wrap:balance}
+header .sub{color:var(--ink2);max-width:70ch;margin:0}
+.eyebrow{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 10px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 16px}
+.tile .k{font-size:12px;color:var(--muted);letter-spacing:.04em}
+.tile .v{font-family:Consolas,ui-monospace,monospace;font-size:24px;font-variant-numeric:tabular-nums;margin-top:2px}
+.tile .d{font-size:12px;color:var(--ink2)}
+.v.up{color:var(--good)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px 18px 12px}
+.card h2{font-family:Georgia,serif;font-weight:400;font-size:19px;margin:0 0 2px}
+.card .note{font-size:13px;color:var(--ink2);margin:0 0 10px}
+.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--ink2);margin:6px 0 4px}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+.legend i{width:14px;height:3px;border-radius:2px;display:inline-block}
+.chartbox{position:relative}
+svg{display:block;width:100%;height:auto}
+.tip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--border);
+  border-radius:5px;padding:8px 10px;font-size:12.5px;box-shadow:0 2px 10px rgba(0,0,0,.18);
+  min-width:150px;display:none;z-index:3}
+.tip b{font-family:Consolas,ui-monospace,monospace;font-variant-numeric:tabular-nums;font-weight:600}
+.tip .row{display:flex;justify-content:space-between;gap:14px}
+.tip i{width:9px;height:9px;border-radius:2px;display:inline-block;margin-right:5px}
+details{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 18px}
+summary{cursor:pointer;font-size:14px;color:var(--ink2);padding:8px 0}
+summary:focus-visible{outline:2px solid var(--s-port);outline-offset:2px}
+.tblwrap{overflow-x:auto;max-height:420px;overflow-y:auto;margin:6px 0 14px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:5px 12px;text-align:right;font-variant-numeric:tabular-nums;font-family:Consolas,ui-monospace,monospace;white-space:nowrap}
+th:first-child,td:first-child{text-align:left;font-family:inherit}
+th{position:sticky;top:0;background:var(--surface);color:var(--muted);font-weight:600;font-size:12px;border-bottom:1px solid var(--axis)}
+tr:nth-child(even) td{background:color-mix(in srgb,var(--grid) 30%,transparent)}
+td.neg{color:var(--neg)} td.pos{color:var(--good)}
+.method{font-size:13px;color:var(--ink2);max-width:75ch}
+.method ul{margin:6px 0 0;padding-left:18px}
+@media (prefers-reduced-motion: no-preference){ .tile{transition:border-color .15s} }
+</style>
+
+<div class="wrap">
+<header>
+  <p class="eyebrow">Asia Sweep IDX · бэктест-отчёт · 13 июля 2026</p>
+  <h1>Портфель GER40 + NAS100: помесячная кривая за 5 лет</h1>
+  <p class="sub">426 сделок из TRD-экспорта тестера (июнь 2021 — июль 2026), финальный конфиг Auto ZOI H4 + новости ±30м.
+  Все суммы приведены к выбранному боевому риску <b>1% на сделку</b>, депозит 2×$10&#8239;000.</p>
+</header>
+
+<section class="tiles" id="tiles"></section>
+
+<section class="card">
+  <h2>Кривая эквити</h2>
+  <p class="note">Накопленный результат по месяцам, $. Серая полоса — самый глубокий провал портфеля (апрель 2024 → май 2025).</p>
+  <div class="legend" id="legend1"></div>
+  <div class="chartbox" id="eqbox"><div class="tip" id="tip1"></div></div>
+</section>
+
+<section class="card">
+  <h2>Портфель по месяцам</h2>
+  <p class="note">Суммарный P/L двух потоков за месяц. 36 месяцев из 62 в плюсе; оба инструмента минусуют одновременно лишь в 14.</p>
+  <div class="chartbox" id="barbox"><div class="tip" id="tip2"></div></div>
+</section>
+
+<details>
+  <summary>Таблица: все 62 месяца</summary>
+  <div class="tblwrap"><table id="tbl">
+    <thead><tr><th>Месяц</th><th>GER40, $</th><th>NAS100, $</th><th>Портфель, $</th><th>Накоплено, $</th></tr></thead>
+    <tbody></tbody>
+  </table></div>
+</details>
+
+<section class="method">
+  <p class="eyebrow">Методика</p>
+  <ul>
+    <li>Сделки выгружены TRD-метками из 18 реплей-окон на инструмент + 6 патч-окон на стыках; дубли на перекрытиях сняты по времени входа.</li>
+    <li>P/L сделки отнесён к месяцу закрытия. Тестер считал риск 2% от эквити окна — для отчёта суммы поделены на 2 (риск 1%); внутриоконное сложное сложение даёт погрешность единицы процентов.</li>
+    <li>Контроль: сумма GER40 $7402 против $7413 сплошного прогона; live-окна обоих инструментов совпали с тестером тик-в-тик.</li>
+  </ul>
+</section>
+</div>
+
+<script>
+const RAW=[{"m":"2021-06","g":0,"n":-195},{"m":"2021-07","g":0,"n":251},{"m":"2021-08","g":234,"n":-397},{"m":"2021-09","g":-206,"n":183},{"m":"2021-10","g":820,"n":569},{"m":"2021-11","g":570,"n":715},{"m":"2021-12","g":216,"n":1308},{"m":"2022-01","g":433,"n":137},{"m":"2022-02","g":-796,"n":-429},{"m":"2022-03","g":1287,"n":-256},{"m":"2022-04","g":510,"n":-118},{"m":"2022-05","g":670,"n":-560},{"m":"2022-06","g":-3,"n":-172},{"m":"2022-07","g":165,"n":392},{"m":"2022-08","g":-617,"n":71},{"m":"2022-09","g":1297,"n":-613},{"m":"2022-10","g":-806,"n":845},{"m":"2022-11","g":-412,"n":-440},{"m":"2022-12","g":1238,"n":392},{"m":"2023-01","g":3191,"n":-221},{"m":"2023-02","g":9,"n":-395},{"m":"2023-03","g":-219,"n":-772},{"m":"2023-04","g":-205,"n":795},{"m":"2023-05","g":0,"n":-201},{"m":"2023-06","g":-998,"n":-176},{"m":"2023-07","g":-191,"n":902},{"m":"2023-08","g":354,"n":-189},{"m":"2023-09","g":216,"n":952},{"m":"2023-10","g":3,"n":1601},{"m":"2023-11","g":-211,"n":249},{"m":"2023-12","g":877,"n":86},{"m":"2024-01","g":-166,"n":-533},{"m":"2024-02","g":247,"n":678},{"m":"2024-03","g":668,"n":1418},{"m":"2024-04","g":-70,"n":629},{"m":"2024-05","g":-203,"n":-193},{"m":"2024-06","g":0,"n":-716},{"m":"2024-07","g":-598,"n":-105},{"m":"2024-08","g":-725,"n":1283},{"m":"2024-09","g":-176,"n":-414},{"m":"2024-10","g":-25,"n":105},{"m":"2024-11","g":-240,"n":-87},{"m":"2024-12","g":589,"n":-594},{"m":"2025-01","g":-901,"n":285},{"m":"2025-02","g":134,"n":-614},{"m":"2025-03","g":-555,"n":-374},{"m":"2025-04","g":226,"n":-492},{"m":"2025-05","g":-384,"n":-131},{"m":"2025-06","g":-483,"n":1219},{"m":"2025-07","g":762,"n":297},{"m":"2025-08","g":-217,"n":648},{"m":"2025-09","g":-204,"n":191},{"m":"2025-10","g":0,"n":1114},{"m":"2025-11","g":911,"n":437},{"m":"2025-12","g":-27,"n":124},{"m":"2026-01","g":132,"n":129},{"m":"2026-02","g":1084,"n":-57},{"m":"2026-03","g":124,"n":1930},{"m":"2026-04","g":351,"n":892},{"m":"2026-05","g":-328,"n":-214},{"m":"2026-06","g":261,"n":633},{"m":"2026-07","g":-211,"n":-442}];
+const K=0.5; // риск 2% → 1%
+const D=RAW.map(r=>({m:r.m,g:r.g*K,n:r.n*K,p:(r.g+r.n)*K}));
+let cg=0,cn=0,cp=0;
+for(const d of D){cg+=d.g;cn+=d.n;cp+=d.p;d.cg=cg;d.cn=cn;d.cp=cp;}
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const fm=v=>(v<0?'−':'')+Math.abs(Math.round(v)).toLocaleString('ru-RU');
+const fmS=v=>(v>0?'+':v<0?'−':'')+Math.abs(Math.round(v)).toLocaleString('ru-RU');
+const NBSP=' ';
+
+// ---- плитки ----
+let peak=0,maxDD=0;for(const d of D){peak=Math.max(peak,d.cp);maxDD=Math.max(maxDD,peak-d.cp);}
+const posM=D.filter(d=>d.p>0).length;
+const tiles=[
+ ['Итог за 62 мес','+$'+fm(cp),'+'+(cp/20000*100).toFixed(1)+'% к депо $20k','up'],
+ ['Средний месяц','+$'+fm(cp/D.length),'≈ +'+(cp/D.length/20000*100).toFixed(2)+'%/мес','up'],
+ ['Макс. просадка','−$'+fm(maxDD),(maxDD/20000*100).toFixed(1)+'% · апр 24 → май 25',''],
+ ['Месяцев в плюсе',posM+' из '+D.length,'GER40: 34 · NAS100: 33',''],
+ ['Корреляция потоков','−0.06','месячные P/L независимы','']
+];
+document.getElementById('tiles').innerHTML=tiles.map(t=>
+ `<div class="tile"><div class="k">${t[0]}</div><div class="v ${t[3]}">${t[1]}</div><div class="d">${t[2]}</div></div>`).join('');
+
+// ---- общие помощники ----
+function mkSvg(w,h){const s=document.createElementNS('http://www.w3.org/2000/svg','svg');
+ s.setAttribute('viewBox',`0 0 ${w} ${h}`);return s;}
+const YEARS=D.map((d,i)=>({i,y:d.m.slice(0,4)})).filter((o,_,a)=>o.i===0||a[o.i-1].y!==o.y);
+
+// ---- кривая эквити ----
+(function(){
+ const W=960,H=400,L=62,R=88,T=18,B=34;
+ const lo=Math.min(0,...D.map(d=>Math.min(d.cg,d.cn,d.cp)));
+ const hi=Math.max(...D.map(d=>Math.max(d.cg,d.cn,d.cp)));
+ const X=i=>L+i*(W-L-R)/(D.length-1);
+ const Y=v=>T+(hi-v)*(H-T-B)/(hi-lo);
+ const svg=mkSvg(W,H);let g='';
+ // просадка: пик 2024-04 (i=34) → дно 2025-05 (i=47)
+ g+=`<rect x="${X(34)}" y="${T}" width="${X(47)-X(34)}" height="${H-T-B}" fill="var(--grid)" opacity=".45"/>`;
+ const step=2000;
+ for(let v=Math.ceil(lo/step)*step;v<=hi;v+=step){
+  g+=`<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--grid)" stroke-width="1"/>`;
+  g+=`<text x="${L-8}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${v/1000}${v?NBSP+'т':''}</text>`;}
+ g+=`<line x1="${L}" x2="${W-R}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--axis)" stroke-width="1.2"/>`;
+ for(const yr of YEARS)g+=`<text x="${X(yr.i)}" y="${H-10}" font-size="11" fill="var(--muted)">${yr.y}</text>`;
+ const path=k=>D.map((d,i)=>(i?'L':'M')+X(i).toFixed(1)+' '+Y(d[k]).toFixed(1)).join('');
+ const series=[['cg','--s-ger','GER40'],['cn','--s-nas','NAS100'],['cp','--s-port','Портфель']];
+ for(const [k,c] of series)g+=`<path d="${path(k)}" fill="none" stroke="var(${c})" stroke-width="${k==='cp'?2.6:1.8}" stroke-linejoin="round"/>`;
+ // прямые подписи у правых концов
+ const last=D[D.length-1];
+ const ends=series.map(([k,c,n])=>({y:Y(last[k]),c,n,v:last[k]})).sort((a,b)=>a.y-b.y);
+ for(let i=1;i<ends.length;i++)if(ends[i].y-ends[i-1].y<15)ends[i].y=ends[i-1].y+15;
+ for(const e of ends)g+=`<text x="${W-R+7}" y="${e.y+4}" font-size="12" fill="var(--ink2)"><tspan fill="var(${e.c})">●</tspan> ${e.n} <tspan font-family="Consolas,monospace">${fmS(e.v)}</tspan></text>`;
+ g+=`<line id="xh" x1="0" x2="0" y1="${T}" y2="${H-B}" stroke="var(--axis)" stroke-width="1" visibility="hidden"/>`;
+ for(const [k,c] of series)g+=`<circle id="dot-${k}" r="4" fill="var(${c})" stroke="var(--surface)" stroke-width="2" visibility="hidden"/>`;
+ svg.innerHTML=g;
+ const box=document.getElementById('eqbox');box.appendChild(svg);
+ document.getElementById('legend1').innerHTML=series.slice().reverse().map(([k,c,n])=>
+  `<span><i style="background:var(${c})"></i>${n}</span>`).join('');
+ const tip=document.getElementById('tip1');
+ svg.addEventListener('pointermove',ev=>{
+  const r=svg.getBoundingClientRect(),sx=W/r.width;
+  const mx=(ev.clientX-r.left)*sx;
+  const i=Math.max(0,Math.min(D.length-1,Math.round((mx-L)/((W-L-R)/(D.length-1)))));
+  const d=D[i],x=X(i);
+  svg.querySelector('#xh').setAttribute('visibility','visible');
+  svg.querySelector('#xh').setAttribute('x1',x);svg.querySelector('#xh').setAttribute('x2',x);
+  for(const [k] of series){const dd=svg.querySelector('#dot-'+k);dd.setAttribute('visibility','visible');dd.setAttribute('cx',x);dd.setAttribute('cy',Y(d[k]));}
+  tip.style.display='block';
+  tip.innerHTML=`<b>${d.m}</b>`+
+   `<div class="row"><span><i style="background:var(--s-port)"></i>Портфель</span><b>${fmS(d.cp)}</b></div>`+
+   `<div class="row"><span><i style="background:var(--s-ger)"></i>GER40</span><b>${fmS(d.cg)}</b></div>`+
+   `<div class="row"><span><i style="background:var(--s-nas)"></i>NAS100</span><b>${fmS(d.cn)}</b></div>`;
+  const px=x/sx, flip=px>r.width-190;
+  tip.style.left=(flip?px-170:px+14)+'px';tip.style.top=((ev.clientY-r.top)*1-10)+'px';
+ });
+ svg.addEventListener('pointerleave',()=>{tip.style.display='none';
+  svg.querySelector('#xh').setAttribute('visibility','hidden');
+  for(const [k] of series)svg.querySelector('#dot-'+k).setAttribute('visibility','hidden');});
+})();
+
+// ---- бары ----
+(function(){
+ const W=960,H=260,L=62,R=16,T=12,B=30;
+ const lo=Math.min(...D.map(d=>d.p)),hi=Math.max(...D.map(d=>d.p));
+ const X=i=>L+i*(W-L-R)/D.length;
+ const bw=(W-L-R)/D.length-2;
+ const Y=v=>T+(hi-v)*(H-T-B)/(hi-lo);
+ const svg=mkSvg(W,H);let g='';
+ const step=500;
+ for(let v=Math.ceil(lo/step)*step;v<=hi;v+=step){
+  g+=`<line x1="${L}" x2="${W-R}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--grid)" stroke-width="1"/>`;
+  if(v%1000===0)g+=`<text x="${L-8}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${v.toLocaleString('ru-RU')}</text>`;}
+ for(const yr of YEARS)g+=`<text x="${X(yr.i)}" y="${H-8}" font-size="11" fill="var(--muted)">${yr.y}</text>`;
+ D.forEach((d,i)=>{
+  const y0=Y(0),y1=Y(d.p);
+  const top=Math.min(y0,y1),hgt=Math.max(2,Math.abs(y1-y0));
+  g+=`<rect data-i="${i}" x="${X(i).toFixed(1)}" y="${top.toFixed(1)}" width="${bw.toFixed(1)}" height="${hgt.toFixed(1)}" rx="2"
+    fill="var(${d.p<0?'--neg':'--pos'})"/>`;});
+ g+=`<line x1="${L}" x2="${W-R}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--axis)" stroke-width="1.2"/>`;
+ svg.innerHTML=g;
+ const box=document.getElementById('barbox');box.appendChild(svg);
+ const tip=document.getElementById('tip2');
+ svg.addEventListener('pointermove',ev=>{
+  const t=ev.target.closest('rect[data-i]');
+  if(!t){tip.style.display='none';return;}
+  const d=D[+t.dataset.i],r=svg.getBoundingClientRect();
+  tip.style.display='block';
+  tip.innerHTML=`<b>${d.m}</b><div class="row"><span>Портфель</span><b>${fmS(d.p)}</b></div>`+
+   `<div class="row"><span>GER40</span><b>${fmS(d.g)}</b></div><div class="row"><span>NAS100</span><b>${fmS(d.n)}</b></div>`;
+  const px=ev.clientX-r.left,flip=px>r.width-180;
+  tip.style.left=(flip?px-165:px+12)+'px';tip.style.top=(ev.clientY-r.top-10)+'px';
+ });
+ svg.addEventListener('pointerleave',()=>tip.style.display='none');
+})();
+
+// ---- таблица ----
+document.querySelector('#tbl tbody').innerHTML=D.map(d=>{
+ const c=v=>`<td class="${v<0?'neg':v>0?'pos':''}">${fmS(v)}</td>`;
+ return `<tr><td>${d.m}</td>${c(d.g)}${c(d.n)}${c(d.p)}<td>${fmS(d.cp)}</td></tr>`;}).join('');
+</script>

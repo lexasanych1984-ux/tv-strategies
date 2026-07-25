@@ -1,0 +1,651 @@
+﻿//@version=6
+strategy("Asia Sweep IDX v1", shorttitle="ASweep v1", overlay=true, initial_capital=10000, slippage=5, process_orders_on_close=true, margin_long=0, margin_short=0, max_boxes_count=500, max_labels_count=500)
+
+// ── Входы ─────────────────────────────────────────────
+riskPct   = input.float(2.0, "Риск, % equity", minval=0.1, step=0.5)
+minRR     = input.float(1.0, "Минимальный RR", minval=0.1, step=0.1)
+tzStr     = input.string("GMT+3", "Таймзона сессий")
+asiaSess  = input.session("0200-0900", "Азиатская сессия")
+entrySess = input.session("0900-1200", "Окно входа (Лондон)")
+biasMode  = input.string("Both", "Режим направления", options=["Both", "Auto FVG H4", "Auto ZOI H4", "Long only", "Short only"])
+useImp    = input.bool(true, "Импульсный закреп")
+impMult   = input.float(1.0, "Импульс: тело >= X*SMA(тел,20)", minval=0.1, step=0.1)
+slBufT    = input.int(0, "Буфер стопа, тики", minval=0)
+useNoGap  = input.bool(true, "Гэп не считается свипом (нужна проторговка до уровня)")
+useNews   = input.bool(true, "Фильтр новостей (NFP/CPI/FOMC/ЕЦБ)")
+newsWin   = input.int(30, "Окно новостей, +/- мин", minval=5)
+useTrendF = input.bool(false, "SWEEP не против дневного тренда (2 дня подряд)")
+maxZoiAtr = input.float(1.0, "Макс. дистанция до зоны, xATR(H4,14); 0=выкл", minval=0, step=0.5)
+showViz   = input.bool(false, "Показывать линии Азии, фон и таблицу")
+showTrades = input.bool(true, "Рисовать сделки (long/short боксы)")
+trigMode  = input.string("Диапазон", "Закреп за проторговкой", options=["Диапазон", "Поглощение серии"])
+useAtrReg = input.bool(false, "Режим: торговать только при ATR(D,14) > SMA(ATR,50)")
+minAsiaW  = input.float(0, "Мин. ширина Азии, xATR(D,14); 0=выкл", minval=0, step=0.1)
+maxAsiaW  = input.float(0, "Макс. ширина Азии, xATR(D,14); 0=выкл", minval=0, step=0.1)
+useNewsDay = input.bool(false, "Скип ВЕСЬ день новости (не только +/- окно)")
+
+// ───── Красные новости: NFP, CPI США, FOMC (решение+прессконф), ЕЦБ (решение+прессконф), UTC
+// Покрытие: июнь 2021 – июль 2026 (для 5-летних реплей-прогонов)
+var array<int> newsTs = array.new<int>()
+
+// решение + прессконференция через 30 мин
+f_pushEvt(array<int> arr, int ts) =>
+    array.push(arr, ts)
+    array.push(arr, ts + 1800000)
+
+if barstate.isfirst
+    // NFP, 8:30 ET
+    array.push(newsTs, timestamp("GMT", 2021,  6,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  8,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 11,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  1,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  4, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3,  4, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  5,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  7,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  8,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  9,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 10,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 11,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 12,  2, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  1,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  2,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  4,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  5,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  6,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  7,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  8,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  9,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 10,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 11,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 12,  8, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  1,  5, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  2,  2, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  3,  8, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  4,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  5,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  6,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  7,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  8,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  9,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 10,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 11,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 12,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  1, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  2,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  3,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  4,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  5,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  6,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  7,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  8,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  9,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 11, 20, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 12, 16, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  1,  9, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  2,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  3,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  4,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  5,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  6,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  7,  2, 12, 30))
+    // CPI США, 8:30 ET
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  8, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 11, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  1, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  5, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  7, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  8, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  9, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 10, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 11, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 12, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  1, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  2, 14, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  3, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  4, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  5, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  6, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  7, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  8, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  9, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 10, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 11, 14, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 12, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  1, 11, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  2, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  3, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  5, 15, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  6, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  7, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  8, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  9, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 10, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 11, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 12, 11, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  1, 15, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  2, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  3, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  5, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  6, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  7, 15, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  8, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  9, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 10, 24, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 12, 18, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  1, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  2, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  3, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  5, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  7, 14, 12, 30))
+    // FOMC: решение 14:00 ET, прессконф +30 мин
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  6, 16, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  7, 28, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  9, 22, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021, 11,  3, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021, 12, 15, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  1, 26, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  3, 16, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  5,  4, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  6, 15, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  7, 27, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  9, 21, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 11,  2, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 12, 14, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  2,  1, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  3, 22, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  5,  3, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  6, 14, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  7, 26, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  9, 20, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 11,  1, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 12, 13, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  1, 31, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  3, 20, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  5,  1, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  6, 12, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  7, 31, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  9, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 11,  7, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 12, 18, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  1, 29, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  3, 19, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  5,  7, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  6, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  7, 30, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  9, 17, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 10, 29, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 12, 10, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  1, 28, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  3, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  4, 29, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  6, 17, 18,  0))
+    // ЕЦБ до июля 2022: решение 13:45, прессконф 14:30 CET/CEST
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 22, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 22, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  9, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  9, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 28, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 28, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 16, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 16, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  3, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 14, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  9, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  9, 12, 30))
+    // ЕЦБ с июля 2022: решение 14:15 CET/CEST, прессконф +30 мин
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  7, 21, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  9,  8, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 10, 27, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 12, 15, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  2,  2, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  3, 16, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  5,  4, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  6, 15, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  7, 27, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  9, 14, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 10, 26, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 12, 14, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  1, 25, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  3,  7, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  4, 11, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  6,  6, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  7, 18, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  9, 12, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 10, 17, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 12, 12, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  1, 30, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  3,  6, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  4, 17, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  6,  5, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  7, 24, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  9, 11, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 10, 30, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 12, 18, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  2,  5, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  3, 19, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  4, 30, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  6, 11, 12, 15))
+    array.sort(newsTs, order.ascending)
+
+newsWinMs = newsWin * 60 * 1000
+f_newsBlocked() =>
+    bool blk = false
+    if useNews and array.size(newsTs) > 0
+        for i = 0 to array.size(newsTs) - 1
+            int ts = array.get(newsTs, i)
+            if ts - newsWinMs > time_close
+                break
+            if time_close <= ts + newsWinMs
+                blk := true
+                break
+    blk
+// Скип всего календарного дня новости (в таймзоне сессий tzStr).
+// Гипотеза NAS100: релиз 08:30 ET рвёт ночной диапазон ДО кэш-опена — день испорчен целиком.
+// Скипаем только если новость выходит ДО конца окна входа (FOMC 14:00 ET день не убивает).
+entEndTxt = array.get(str.split(entrySess, "-"), 1)
+entEndMin = math.round(str.tonumber(str.substring(entEndTxt, 0, 2)) * 60 + str.tonumber(str.substring(entEndTxt, 2, 4)))
+f_newsDayBlocked() =>
+    bool blk = false
+    if useNewsDay and array.size(newsTs) > 0
+        for i = 0 to array.size(newsTs) - 1
+            int ts = array.get(newsTs, i)
+            if ts > time_close + 86400000 * 2
+                break
+            if ts < time_close - 86400000 * 2
+                continue
+            sameDay = year(ts, tzStr) == year(time_close, tzStr) and month(ts, tzStr) == month(time_close, tzStr) and dayofmonth(ts, tzStr) == dayofmonth(time_close, tzStr)
+            if sameDay and hour(ts, tzStr) * 60 + minute(ts, tzStr) <= entEndMin
+                blk := true
+                break
+    blk
+newsBlk = f_newsBlocked() or f_newsDayBlocked()
+
+// ── H4 FVG магнит (v1, для режима Auto FVG H4) ─────────
+f_zoi() =>
+    var zTop = array.new_float()
+    var zBot = array.new_float()
+    var zPos = array.new_int()
+    if low > high[2]
+        array.unshift(zTop, low)
+        array.unshift(zBot, high[2])
+        array.unshift(zPos, 1)
+    if high < low[2]
+        array.unshift(zTop, low[2])
+        array.unshift(zBot, high)
+        array.unshift(zPos, -1)
+    if array.size(zPos) > 0
+        for i = array.size(zPos) - 1 to 0
+            mitig = array.get(zPos, i) == 1 ? low <= array.get(zBot, i) : high >= array.get(zTop, i)
+            if mitig
+                array.remove(zTop, i)
+                array.remove(zBot, i)
+                array.remove(zPos, i)
+    while array.size(zPos) > 20
+        array.pop(zTop)
+        array.pop(zBot)
+        array.pop(zPos)
+    b = 0
+    best = 1.0e10
+    if array.size(zPos) > 0
+        for i = 0 to array.size(zPos) - 1
+            zt = array.get(zTop, i)
+            zb = array.get(zBot, i)
+            if close > zt and close - zt < best
+                best := close - zt
+                b := -1
+            if close < zb and zb - close < best
+                best := zb - close
+                b := 1
+    b
+
+// ── H4 все типы ЗОИ (v2): FVG=0, OB=1, RB=2, SWEEP=3 ──
+// код: 0 нет ЗОИ; ±(kind+1) — знак = направление к зоне
+f_zoi2() =>
+    var zTop  = array.new_float()
+    var zBot  = array.new_float()
+    var zPos  = array.new_int()
+    var zKind = array.new_int()
+    var zBar  = array.new_int()
+    atrH4  = ta.atr(14)
+    bodySz = math.abs(close - open)
+    avgB   = ta.sma(bodySz, 20)
+    hh10   = ta.highest(high, 10)
+    ll10   = ta.lowest(low, 10)
+    prevHH = ta.highest(high, 20)[1]
+    prevLL = ta.lowest(low, 20)[1]
+    // FVG
+    if low > high[2]
+        array.unshift(zTop, low)
+        array.unshift(zBot, high[2])
+        array.unshift(zPos, 1)
+        array.unshift(zKind, 0)
+        array.unshift(zBar, bar_index)
+    if high < low[2]
+        array.unshift(zTop, low[2])
+        array.unshift(zBot, high)
+        array.unshift(zPos, -1)
+        array.unshift(zKind, 0)
+        array.unshift(zBar, bar_index)
+    // OB: последняя контр-свеча перед импульсом (тело >= 1.5*ср, пробой её экстремума)
+    if close[1] < open[1] and close > open and bodySz >= 1.5 * avgB and close > high[1]
+        array.unshift(zTop, high[1])
+        array.unshift(zBot, low[1])
+        array.unshift(zPos, 1)
+        array.unshift(zKind, 1)
+        array.unshift(zBar, bar_index)
+    if close[1] > open[1] and close < open and bodySz >= 1.5 * avgB and close < low[1]
+        array.unshift(zTop, high[1])
+        array.unshift(zBot, low[1])
+        array.unshift(zPos, -1)
+        array.unshift(zKind, 1)
+        array.unshift(zBar, bar_index)
+    // RB: пин (тень >= 2*тела) на экстремуме 10 баров
+    wLo = math.min(open, close) - low
+    wHi = high - math.max(open, close)
+    if wLo >= 2 * bodySz and low == ll10
+        array.unshift(zTop, math.min(open, close))
+        array.unshift(zBot, low)
+        array.unshift(zPos, 1)
+        array.unshift(zKind, 2)
+        array.unshift(zBar, bar_index)
+    if wHi >= 2 * bodySz and high == hh10
+        array.unshift(zTop, high)
+        array.unshift(zBot, math.max(open, close))
+        array.unshift(zPos, -1)
+        array.unshift(zKind, 2)
+        array.unshift(zBar, bar_index)
+    // Митигация: FVG — полное заполнение, OB/RB — касание. Свежесозданные не трогаем.
+    if array.size(zKind) > 0
+        for i = array.size(zKind) - 1 to 0
+            if array.get(zBar, i) != bar_index
+                k  = array.get(zKind, i)
+                p  = array.get(zPos, i)
+                t  = array.get(zTop, i)
+                bt = array.get(zBot, i)
+                mit = k == 0 ? (p == 1 ? low <= bt : high >= t) : (p == 1 ? low <= t : high >= bt)
+                if mit
+                    array.remove(zTop, i)
+                    array.remove(zBot, i)
+                    array.remove(zPos, i)
+                    array.remove(zKind, i)
+                    array.remove(zBar, i)
+    while array.size(zKind) > 30
+        array.pop(zTop)
+        array.pop(zBot)
+        array.pop(zPos)
+        array.pop(zKind)
+        array.pop(zBar)
+    // SWEEP: пробой 20-барного экстремума с возвратом, активен 6 баров H4
+    var int swpDir = 0
+    var int swpAge = 999
+    swpAge := swpAge + 1
+    if high > prevHH and close < prevHH
+        swpDir := -1
+        swpAge := 0
+    if low < prevLL and close > prevLL
+        swpDir := 1
+        swpAge := 0
+    actSwp = swpAge <= 6 ? swpDir : 0
+    code = 0
+    if actSwp != 0
+        code := actSwp * 4
+    else
+        best = 1.0e10
+        if array.size(zKind) > 0
+            for i = 0 to array.size(zKind) - 1
+                t  = array.get(zTop, i)
+                bt = array.get(zBot, i)
+                if close > t and close - t < best and (maxZoiAtr == 0 or close - t <= maxZoiAtr * atrH4)
+                    best := close - t
+                    code := -(array.get(zKind, i) + 1)
+                if close < bt and bt - close < best and (maxZoiAtr == 0 or bt - close <= maxZoiAtr * atrH4)
+                    best := bt - close
+                    code := array.get(zKind, i) + 1
+    code
+
+zoiBias = request.security(syminfo.tickerid, "240", f_zoi()[1], lookahead=barmerge.lookahead_on)
+zoiCode = request.security(syminfo.tickerid, "240", f_zoi2()[1], lookahead=barmerge.lookahead_on)
+zoiBias2 = zoiCode > 0 ? 1 : zoiCode < 0 ? -1 : 0
+zoiKind  = zoiCode != 0 ? math.abs(zoiCode) - 1 : -1
+
+dAtr   = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead=barmerge.lookahead_on)
+dAtrMa = request.security(syminfo.tickerid, "D", ta.sma(ta.atr(14), 50)[1], lookahead=barmerge.lookahead_on)
+regOK  = not useAtrReg or dAtr > dAtrMa
+
+allowL = biasMode == "Both" or biasMode == "Long only" or biasMode == "Auto FVG H4" and zoiBias == 1 or biasMode == "Auto ZOI H4" and zoiBias2 == 1
+allowS = biasMode == "Both" or biasMode == "Short only" or biasMode == "Auto FVG H4" and zoiBias == -1 or biasMode == "Auto ZOI H4" and zoiBias2 == -1
+
+// ── Сессии и состояние дня ─────────────────────────────
+inAsia  = not na(time(timeframe.period, asiaSess, tzStr))
+inEntry = not na(time(timeframe.period, entrySess, tzStr))
+avgBody = ta.sma(math.abs(close - open), 20)
+ema200  = ta.ema(close, 200)
+f_dtrend() =>
+    up = close[1] > open[1] and close[2] > open[2]
+    dn = close[1] < open[1] and close[2] < open[2]
+    up ? 1 : dn ? -1 : 0
+dTrend = request.security(syminfo.tickerid, "D", f_dtrend(), lookahead=barmerge.lookahead_on)
+strongUp = dTrend == 1
+strongDn = dTrend == -1
+
+var float aHi = na
+var float aLo = na
+var bool  asiaDone = false
+var bool  sweptHi = false
+var bool  sweptLo = false
+var float sweepHi = na
+var float sweepLo = na
+var float postLo = na
+var float postHi = na
+var bool  doneS = false
+var bool  doneL = false
+var float runLoS = na
+var float runHiL = na
+
+postLoPrev = postLo
+postHiPrev = postHi
+
+// серии однонаправленных свечей (для закрепа «поглощение»)
+if close > open
+    runLoS := close[1] > open[1] ? math.min(nz(runLoS, low), low) : low
+if close < open
+    runHiL := close[1] < open[1] ? math.max(nz(runHiL, high), high) : high
+
+if inAsia and not inAsia[1]
+    aHi := high
+    aLo := low
+    asiaDone := false
+    sweptHi := false
+    sweptLo := false
+    sweepHi := na
+    sweepLo := na
+    postLo := na
+    postHi := na
+    doneS := false
+    doneL := false
+    runLoS := na
+    runHiL := na
+else if inAsia
+    aHi := math.max(aHi, high)
+    aLo := math.min(aLo, low)
+
+if not inAsia and inAsia[1]
+    asiaDone := true
+
+// ── Свипы экстремумов Азии ─────────────────────────────
+if asiaDone and not na(aHi)
+    if not sweptHi and high > aHi and (not useNoGap or open <= aHi)
+        sweptHi := true
+    if sweptHi
+        sweepHi := na(sweepHi) ? high : math.max(sweepHi, high)
+    if not sweptLo and low < aLo and (not useNoGap or open >= aLo)
+        sweptLo := true
+    if sweptLo
+        sweepLo := na(sweepLo) ? low : math.min(sweepLo, low)
+
+flat = strategy.position_size == 0
+impOK = not useImp or math.abs(close - open) >= impMult * avgBody
+
+// ── Статистика по типам ЗОИ ────────────────────────────
+var tProf = array.new_float(5, 0.0)
+var tWin  = array.new_int(5, 0)
+var tLoss = array.new_int(5, 0)
+var int lastClosed = 0
+var int pendK = 4
+var int   tDir = 0
+var int   tBar = na
+var int   tTime = na
+var float tEntry = na
+var float tSL = na
+var float tTP = na
+
+// ── Шорт: свип хая → закреп телом под проторговкой ────
+widthOK = (minAsiaW == 0 or not na(aHi) and not na(dAtr) and aHi - aLo >= minAsiaW * dAtr) and (maxAsiaW == 0 or not na(aHi) and not na(dAtr) and aHi - aLo <= maxAsiaW * dAtr)
+trendOKs = not useTrendF or zoiKind != 3 or not strongUp
+trigCondS = trigMode == "Диапазон" ? not na(postLoPrev) and close < postLoPrev : not na(runLoS) and close < runLoS
+trigS = asiaDone and allowS and sweptHi and not doneS and flat and inEntry and trigCondS and close < open and impOK and not newsBlk and trendOKs and regOK and widthOK
+if trigS
+    slP = sweepHi + slBufT * syminfo.mintick
+    tpP = aLo
+    riskD = slP - close
+    rewD = close - tpP
+    if riskD > 0 and rewD > 0 and rewD / riskD >= minRR
+        qty = strategy.equity * riskPct / 100.0 / (riskD * syminfo.pointvalue)
+        if qty > 0
+            strategy.entry("S", strategy.short, qty=qty, alert_message="ASIA SHORT " + syminfo.ticker + " | вход " + str.tostring(close, format.mintick) + " | SL " + str.tostring(slP, format.mintick) + " | TP " + str.tostring(tpP, format.mintick) + " | RR " + str.tostring(rewD / riskD, "#.##"))
+            strategy.exit("Sx", "S", stop=slP, limit=tpP, alert_message="ASIA ВЫХОД short " + syminfo.ticker)
+            pendK := zoiBias2 == -1 and zoiKind >= 0 ? zoiKind : 4
+            tDir := -1
+            tBar := bar_index
+            tTime := time
+            tEntry := close
+            tSL := slP
+            tTP := tpP
+            doneL := true
+    doneS := true
+
+// ── Лонг: свип лоя → закреп телом над проторговкой ─────
+trendOKl = not useTrendF or zoiKind != 3 or not strongDn
+trigCondL = trigMode == "Диапазон" ? not na(postHiPrev) and close > postHiPrev : not na(runHiL) and close > runHiL
+trigL = asiaDone and allowL and sweptLo and not doneL and flat and inEntry and trigCondL and close > open and impOK and not newsBlk and trendOKl and regOK and widthOK
+if trigL
+    slP2 = sweepLo - slBufT * syminfo.mintick
+    tpP2 = aHi
+    riskD2 = close - slP2
+    rewD2 = tpP2 - close
+    if riskD2 > 0 and rewD2 > 0 and rewD2 / riskD2 >= minRR
+        qty2 = strategy.equity * riskPct / 100.0 / (riskD2 * syminfo.pointvalue)
+        if qty2 > 0
+            strategy.entry("L", strategy.long, qty=qty2, alert_message="ASIA LONG " + syminfo.ticker + " | вход " + str.tostring(close, format.mintick) + " | SL " + str.tostring(slP2, format.mintick) + " | TP " + str.tostring(tpP2, format.mintick) + " | RR " + str.tostring(rewD2 / riskD2, "#.##"))
+            strategy.exit("Lx", "L", stop=slP2, limit=tpP2, alert_message="ASIA ВЫХОД long " + syminfo.ticker)
+            pendK := zoiBias2 == 1 and zoiKind >= 0 ? zoiKind : 4
+            tDir := 1
+            tBar := bar_index
+            tTime := time
+            tEntry := close
+            tSL := slP2
+            tTP := tpP2
+            doneS := true
+    doneL := true
+
+// ── Атрибуция закрытой сделки к типу ЗОИ + отрисовка ───
+if strategy.closedtrades > lastClosed
+    prof = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    array.set(tProf, pendK, array.get(tProf, pendK) + prof)
+    if prof > 0
+        array.set(tWin, pendK, array.get(tWin, pendK) + 1)
+    else
+        array.set(tLoss, pendK, array.get(tLoss, pendK) + 1)
+    lastClosed := strategy.closedtrades
+    if showTrades and not na(tBar) and tDir != 0
+        if tDir == 1
+            box.new(tBar, tTP, bar_index, tEntry, border_color=color.new(color.green, 45), bgcolor=color.new(color.green, 80))
+            box.new(tBar, tEntry, bar_index, tSL, border_color=color.new(color.red, 45), bgcolor=color.new(color.red, 80))
+            label.new(tBar, tSL, "LONG " + str.tostring(tEntry, format.mintick), style=label.style_label_up, color=color.new(color.green, 60), textcolor=color.white, size=size.small)
+        else
+            box.new(tBar, tEntry, bar_index, tTP, border_color=color.new(color.green, 45), bgcolor=color.new(color.green, 80))
+            box.new(tBar, tSL, bar_index, tEntry, border_color=color.new(color.red, 45), bgcolor=color.new(color.red, 80))
+            label.new(tBar, tSL, "SHORT " + str.tostring(tEntry, format.mintick), style=label.style_label_down, color=color.new(color.red, 60), textcolor=color.white, size=size.small)
+    if not na(tBar) and tDir != 0
+        label.new(tBar, tEntry, "TRD|" + (tDir == 1 ? "L" : "S") + "|" + str.tostring(tTime) + "|" + str.tostring(time) + "|" + str.tostring(tEntry) + "|" + str.tostring(tSL) + "|" + str.tostring(tTP) + "|" + str.tostring(prof, "#.##"), color=color.new(color.white, 100), textcolor=color.new(color.white, 100), style=label.style_none, size=size.tiny)
+    tDir := 0
+    tBar := na
+
+// ── Обновление проторговки ПОСЛЕ оценки триггеров ──────
+if sweptHi and asiaDone
+    postLo := na(postLo) ? low : math.min(postLo, low)
+if sweptLo and asiaDone
+    postHi := na(postHi) ? high : math.max(postHi, high)
+
+// ── Визуализация и статтаблица ─────────────────────────
+plot(showViz ? aHi : na, "Asia High", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(showViz ? aLo : na, "Asia Low", color.new(color.teal, 0), 1, plot.style_linebr)
+bgcolor(showViz and inAsia ? color.new(color.gray, 92) : na)
+
+var table tt = table.new(position.bottom_right, 1, 7)
+if showViz and (barstate.islast or barstate.islastconfirmedhistory)
+    names = array.from("FVG", "OB", "RB", "SWEEP", "NONE")
+    table.cell(tt, 0, 0, "AsiaSweep v2.8n | TF " + timeframe.period + " | " + biasMode + (useNews ? " | news" : "") + (useNewsDay ? " | newsDAY" : "") + (useTrendF ? " | trendD" : " | notrend") + (maxZoiAtr > 0 ? " | zoi<=" + str.tostring(maxZoiAtr) + "atr" : " | zoi:any") + (trigMode == "Диапазон" ? " | rng" : " | eng") + (useAtrReg ? " | atrReg" : "") + (minAsiaW > 0 ? " | asiaW>=" + str.tostring(minAsiaW, "#.#") : "") + (maxAsiaW > 0 ? " | asiaW<=" + str.tostring(maxAsiaW, "#.#") : "") + " | вход " + entrySess, text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small)
+    logLine = "ZOISTAT"
+    for i = 0 to 4
+        w = array.get(tWin, i)
+        l = array.get(tLoss, i)
+        pr = array.get(tProf, i)
+        rowTxt = array.get(names, i) + ": n=" + str.tostring(w + l) + " W" + str.tostring(w) + "/L" + str.tostring(l) + " " + str.tostring(pr, "#") + "eur (" + str.tostring(pr / 100.0, "#.##") + "%)"
+        table.cell(tt, 0, i + 1, rowTxt, text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+        logLine := logLine + " | " + rowTxt
+    table.cell(tt, 0, 6, "Итог: " + str.tostring(strategy.netprofit, "#") + "eur (" + str.tostring(strategy.netprofit / 100.0, "#.##") + "%)", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=size.small)
+    log.info(logLine)
+
+// ── Статтаблица (как на EURUSD) ────────────────────────
+var table tbl = table.new(position.top_right, 2, 8, bgcolor=color.new(#131722, 10), border_width=1, border_color=color.new(color.gray, 60))
+if barstate.islastconfirmedhistory or barstate.islast
+    total = strategy.closedtrades
+    wins = strategy.wintrades
+    wr = total > 0 ? 100.0 * wins / total : 0.0
+    pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    npCol = strategy.netprofit >= 0 ? color.lime : color.red
+    txt = color.new(color.white, 15)
+    table.cell(tbl, 0, 0, "AsiaSweep v2.5 Азия→Лондон", text_color=color.orange, text_size=size.small)
+    table.cell(tbl, 1, 0, syminfo.ticker + " M" + timeframe.period, text_color=color.orange, text_size=size.small)
+    table.cell(tbl, 0, 1, "Сделок", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(total), text_color=txt, text_size=size.small)
+    table.cell(tbl, 0, 2, "Winrate", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(wr, "#.#") + " %", text_color=txt, text_size=size.small)
+    table.cell(tbl, 0, 3, "Profit Factor", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 3, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color=txt, text_size=size.small)
+    table.cell(tbl, 0, 4, "Net Profit", text_color=npCol, text_size=size.small)
+    table.cell(tbl, 1, 4, str.tostring(strategy.netprofit, "#.##") + " (" + str.tostring(strategy.netprofit / 100.0, "#.##") + "%)", text_color=npCol, text_size=size.small)
+    table.cell(tbl, 0, 5, "Направление", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 5, biasMode, text_color=txt, text_size=size.small)
+    table.cell(tbl, 0, 6, "Новости / вход", text_color=useNews ? color.lime : color.gray, text_size=size.small)
+    table.cell(tbl, 1, 6, (useNews ? "±" + str.tostring(newsWin) + "м" : "OFF") + " / " + entrySess, text_color=useNews ? color.lime : color.gray, text_size=size.small)
+    table.cell(tbl, 0, 7, "Зона до входа", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 7, maxZoiAtr > 0 ? "<=" + str.tostring(maxZoiAtr, "#.#") + "xATR(H4)" : "любая", text_color=txt, text_size=size.small)

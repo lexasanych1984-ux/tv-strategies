@@ -1,0 +1,66 @@
+//@version=6
+indicator("CRT Day Detector v0.1", "CRT v0.1", overlay = true, max_labels_count = 500)
+
+// Дневные свечи считаем локально по смене дня (работаем на H1)
+var float d0h = na
+var float d0l = na
+var float d0c = na
+var float d1h = na
+var float d1l = na
+var float d1c = na
+var float d2h = na
+var float d2l = na
+
+bool newDay = ta.change(time("D")) != 0
+
+var int crtDir = 0      // сигнал на ТЕКУЩИЙ (торговый) день: -1 шорт, +1 лонг
+var float sweepLvl = na // свипнутый уровень (hi/lo дня-диапазона)
+var int nShort = 0
+var int nLong = 0
+
+if barstate.isfirst
+    d0h := high
+    d0l := low
+    d0c := close
+
+if newDay and not barstate.isfirst
+    d2h := d1h
+    d2l := d1l
+    d1h := d0h
+    d1l := d0l
+    d1c := d0c
+    d0h := high
+    d0l := low
+    d0c := close
+    crtDir := 0
+    sweepLvl := na
+    if not na(d2h)
+        // день-1 = манипуляция: свип экстремума дня-2, закрытие обратно внутрь,
+        // противоположный экстремум дня-2 не достигнут
+        bool shortCRT = d1h > d2h and d1c < d2h and d1l > d2l
+        bool longCRT  = d1l < d2l and d1c > d2l and d1h < d2h
+        if shortCRT
+            crtDir := -1
+            sweepLvl := d2h
+            nShort += 1
+        if longCRT
+            crtDir := 1
+            sweepLvl := d2l
+            nLong += 1
+        if crtDir != 0
+            label.new(bar_index, crtDir < 0 ? d1h : d1l,
+                 (crtDir < 0 ? "CRT SHORT " : "CRT LONG ") + str.format_time(time("D") + 12 * 3600 * 1000, "yyyy-MM-dd", "UTC"),
+                 style = crtDir < 0 ? label.style_label_down : label.style_label_up,
+                 color = crtDir < 0 ? color.new(color.red, 20) : color.new(color.green, 20),
+                 textcolor = color.white, size = size.small)
+else if not newDay
+    d0h := math.max(d0h, high)
+    d0l := math.min(d0l, low)
+    d0c := close
+
+bgcolor(crtDir < 0 ? color.new(color.red, 88) : crtDir > 0 ? color.new(color.green, 88) : na)
+plot(crtDir != 0 ? sweepLvl : na, "Sweep level", color = color.orange, style = plot.style_linebr, linewidth = 2)
+
+var table t = table.new(position.top_right, 1, 1)
+if barstate.islast
+    table.cell(t, 0, 0, "CRT v0.1b | S=" + str.tostring(nShort) + " L=" + str.tostring(nLong) + (timeframe.period == "60" ? "" : " / TF=" + timeframe.period + " (нужен 60!)"), text_color = color.white, bgcolor = color.new(color.blue, 30))

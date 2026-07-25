@@ -1,0 +1,154 @@
+//@version=6
+strategy("Asia Sweep IDX v1", shorttitle="ASweep v1", overlay=true, initial_capital=10000, slippage=5, process_orders_on_close=true, margin_long=0, margin_short=0)
+
+// ── Входы ─────────────────────────────────────────────
+riskPct   = input.float(2.0, "Риск, % equity", minval=0.1, step=0.5)
+minRR     = input.float(1.0, "Минимальный RR", minval=0.1, step=0.1)
+tzStr     = input.string("GMT+3", "Таймзона сессий")
+asiaSess  = input.session("0200-0900", "Азиатская сессия")
+entrySess = input.session("0900-1600", "Окно входа (Лондон)")
+biasMode  = input.string("Both", "Режим направления", options=["Both", "Auto FVG H4", "Long only", "Short only"])
+useImp    = input.bool(true, "Импульсный закреп")
+impMult   = input.float(1.0, "Импульс: тело >= X*SMA(тел,20)", minval=0.1, step=0.1)
+slBufT    = input.int(0, "Буфер стопа, тики", minval=0)
+
+// ── H4 FVG магнит: направление к ближайшему непогашенному FVG ──
+f_zoi() =>
+    var zTop = array.new_float()
+    var zBot = array.new_float()
+    var zPos = array.new_int()
+    if low > high[2]
+        array.unshift(zTop, low)
+        array.unshift(zBot, high[2])
+        array.unshift(zPos, 1)
+    if high < low[2]
+        array.unshift(zTop, low[2])
+        array.unshift(zBot, high)
+        array.unshift(zPos, -1)
+    if array.size(zPos) > 0
+        for i = array.size(zPos) - 1 to 0
+            mitig = array.get(zPos, i) == 1 ? low <= array.get(zBot, i) : high >= array.get(zTop, i)
+            if mitig
+                array.remove(zTop, i)
+                array.remove(zBot, i)
+                array.remove(zPos, i)
+    while array.size(zPos) > 20
+        array.pop(zTop)
+        array.pop(zBot)
+        array.pop(zPos)
+    b = 0
+    best = 1.0e10
+    if array.size(zPos) > 0
+        for i = 0 to array.size(zPos) - 1
+            zt = array.get(zTop, i)
+            zb = array.get(zBot, i)
+            if close > zt and close - zt < best
+                best := close - zt
+                b := -1
+            if close < zb and zb - close < best
+                best := zb - close
+                b := 1
+    b
+
+zoiBias = request.security(syminfo.tickerid, "240", f_zoi()[1], lookahead=barmerge.lookahead_on)
+
+allowL = biasMode == "Both" or biasMode == "Long only" or biasMode == "Auto FVG H4" and zoiBias == 1
+allowS = biasMode == "Both" or biasMode == "Short only" or biasMode == "Auto FVG H4" and zoiBias == -1
+
+// ── Сессии и состояние дня ─────────────────────────────
+inAsia  = not na(time(timeframe.period, asiaSess, tzStr))
+inEntry = not na(time(timeframe.period, entrySess, tzStr))
+avgBody = ta.sma(math.abs(close - open), 20)
+
+var float aHi = na
+var float aLo = na
+var bool  asiaDone = false
+var bool  sweptHi = false
+var bool  sweptLo = false
+var float sweepHi = na
+var float sweepLo = na
+var float postLo = na
+var float postHi = na
+var bool  doneS = false
+var bool  doneL = false
+
+postLoPrev = postLo
+postHiPrev = postHi
+
+if inAsia and not inAsia[1]
+    aHi := high
+    aLo := low
+    asiaDone := false
+    sweptHi := false
+    sweptLo := false
+    sweepHi := na
+    sweepLo := na
+    postLo := na
+    postHi := na
+    doneS := false
+    doneL := false
+else if inAsia
+    aHi := math.max(aHi, high)
+    aLo := math.min(aLo, low)
+
+if not inAsia and inAsia[1]
+    asiaDone := true
+
+// ── Свипы экстремумов Азии ─────────────────────────────
+if asiaDone and not na(aHi)
+    if not sweptHi and high > aHi
+        sweptHi := true
+    if sweptHi
+        sweepHi := na(sweepHi) ? high : math.max(sweepHi, high)
+    if not sweptLo and low < aLo
+        sweptLo := true
+    if sweptLo
+        sweepLo := na(sweepLo) ? low : math.min(sweepLo, low)
+
+flat = strategy.position_size == 0
+impOK = not useImp or math.abs(close - open) >= impMult * avgBody
+
+// ── Шорт: свип хая → закреп телом под проторговкой ────
+trigS = asiaDone and allowS and sweptHi and not doneS and flat and inEntry and not na(postLoPrev) and close < postLoPrev and close < open and impOK
+if trigS
+    slP = sweepHi + slBufT * syminfo.mintick
+    tpP = aLo
+    riskD = slP - close
+    rewD = close - tpP
+    if riskD > 0 and rewD > 0 and rewD / riskD >= minRR
+        qty = strategy.equity * riskPct / 100.0 / (riskD * syminfo.pointvalue)
+        if qty > 0
+            strategy.entry("S", strategy.short, qty=qty)
+            strategy.exit("Sx", "S", stop=slP, limit=tpP)
+            doneL := true
+    doneS := true
+
+// ── Лонг: свип лоя → закреп телом над проторговкой ─────
+trigL = asiaDone and allowL and sweptLo and not doneL and flat and inEntry and not na(postHiPrev) and close > postHiPrev and close > open and impOK
+if trigL
+    slP2 = sweepLo - slBufT * syminfo.mintick
+    tpP2 = aHi
+    riskD2 = close - slP2
+    rewD2 = tpP2 - close
+    if riskD2 > 0 and rewD2 > 0 and rewD2 / riskD2 >= minRR
+        qty2 = strategy.equity * riskPct / 100.0 / (riskD2 * syminfo.pointvalue)
+        if qty2 > 0
+            strategy.entry("L", strategy.long, qty=qty2)
+            strategy.exit("Lx", "L", stop=slP2, limit=tpP2)
+            doneS := true
+    doneL := true
+
+// ── Обновление проторговки ПОСЛЕ оценки триггеров ──────
+if sweptHi and asiaDone
+    postLo := na(postLo) ? low : math.min(postLo, low)
+if sweptLo and asiaDone
+    postHi := na(postHi) ? high : math.max(postHi, high)
+
+// ── Визуализация и маркер ──────────────────────────────
+plot(aHi, "Asia High", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(aLo, "Asia Low", color.new(color.teal, 0), 1, plot.style_linebr)
+bgcolor(inAsia ? color.new(color.gray, 92) : na)
+
+var table tt = table.new(position.top_right, 1, 1)
+if barstate.islast
+    table.cell(tt, 0, 0, "AsiaSweep v1.0 | TF " + timeframe.period + " | " + biasMode + (useImp ? " | imp" : " | noimp"), text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small)

@@ -1,0 +1,768 @@
+﻿//@version=6
+strategy("SMC 2-е колено 4H→M15", "SMC-2L", overlay=true,
+     initial_capital=10000, pyramiding=0, margin_long=0, margin_short=0,
+     calc_on_every_tick=false, process_orders_on_close=true, slippage=5,
+     max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ───── Настройки
+riskPct    = input.float(1.0, "Риск на сделку, %", minval=0.1, step=0.1)
+rrMult     = input.float(3.0, "Тейк-профит, R (если нет ликвы)", minval=0.5, step=0.5)
+htfTF      = input.timeframe("240", "ТФ контекста (структура/зоны)")
+frH        = input.int(2, "Контекст: плечо фрактала", minval=1)
+frL        = input.int(2, "Вход: плечо фрактала", minval=1)
+maxBos     = input.int(1, "Макс. № BOS в тренде (1 = только 2-е колено, 10 = все)", minval=1, maxval=10)
+useFVG     = input.bool(true, "POI: FVG контекста")
+useOB      = input.bool(true, "POI: Ордерблок контекста")
+useSWP     = input.bool(true, "POI: Свип фрактала контекста")
+poiLifeH   = input.int(42, "Жизнь сетапа, баров контекста", minval=5)
+useFta     = input.bool(false, "FTA-фильтр")
+ftaLiq     = input.bool(true, "FTA: учитывать ликвидность (фракталы HTF)")
+ftaMinR    = input.float(1.0, "Мин. расстояние до FTA, R", minval=0.5, step=0.25)
+tpLiq      = input.bool(true, "Тейк до ликвидности HTF")
+tpMinR     = input.float(1.5, "Мин. RR до ликвы (иначе пропуск)", minval=0.5, step=0.25)
+tpBuf      = input.int(20, "Отступ тейка от ликвы, тики", minval=0)
+tradeLong  = input.bool(true, "Торговать Long")
+tradeShort = input.bool(true, "Торговать Short")
+useSess    = input.bool(true, "Входы только в сессии Лондон/Нью-Йорк")
+sessLon    = input.session("0800-1700", "Лондон (Europe/London)")
+sessNY     = input.session("0800-1700", "Нью-Йорк (America/New_York)")
+showZones  = input.bool(false, "Показывать зоны POI")
+showTrades = input.bool(true, "Рисовать сделки (long/short боксы)")
+newsMode   = input.int(0, "Красные новости: 0=выкл, 1=день без торговли, 2=окно ±мин", minval=0, maxval=2)
+newsWin    = input.int(30, "Окно вокруг новости, мин (режим 2)", minval=5, step=5)
+riskComp   = input.bool(true, "Риск от текущего депозита (реинвест)")
+useStopBand = input.bool(true, "Фильтр размера стопа (коридор, пипсы)")
+minStopPip  = input.float(20.0, "Мин. стоп, пипсов", minval=0.0, step=1.0)
+maxStopPip  = input.float(60.0, "Макс. стоп, пипсов", minval=0.0, step=5.0)
+useAtrBand  = input.bool(true, "Стоп-коридор по ATR HTF (заменяет пипсовый)")
+atrBandMin  = input.float(0.4, "Мин. стоп, ×ATR HTF", minval=0.0, step=0.1)
+atrBandMax  = input.float(1.2, "Макс. стоп, ×ATR HTF", minval=0.0, step=0.1)
+
+htfMs = timeframe.in_seconds(htfTF) * 1000
+barsPerHtf = math.max(1, math.round(timeframe.in_seconds(htfTF) / timeframe.in_seconds(timeframe.period)))
+pipSz = syminfo.mintick * 10
+
+// ───── Сессионный фильтр
+inSess = not useSess or not na(time(timeframe.period, sessLon, "Europe/London")) or not na(time(timeframe.period, sessNY, "America/New_York"))
+
+// ───── Красные новости: NFP, CPI США, FOMC (решение+прессконф), ЕЦБ (решение+прессконф), UTC
+// Покрытие: июнь 2021 – июль 2026 (для 5-летних реплей-прогонов)
+var array<int> newsTs = array.new<int>()
+
+// решение + прессконференция через 30 мин
+f_pushEvt(array<int> arr, int ts) =>
+    array.push(arr, ts)
+    array.push(arr, ts + 1800000)
+
+if barstate.isfirst
+    // NFP, 8:30 ET
+    array.push(newsTs, timestamp("GMT", 2021,  6,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  8,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 11,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  1,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  4, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3,  4, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  5,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  7,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  8,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  9,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 10,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 11,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 12,  2, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  1,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  2,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  4,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  5,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  6,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  7,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  8,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  9,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 10,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 11,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 12,  8, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  1,  5, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  2,  2, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  3,  8, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  4,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  5,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  6,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  7,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  8,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  9,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 10,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 11,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 12,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  1, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  2,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  3,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  4,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  5,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  6,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  7,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  8,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  9,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 11, 20, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 12, 16, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  1,  9, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  2,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  3,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  4,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  5,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  6,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  7,  2, 12, 30))
+    // CPI США, 8:30 ET
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  8, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 11, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  1, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  5, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  7, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  8, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  9, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 10, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 11, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 12, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  1, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  2, 14, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  3, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  4, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  5, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  6, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  7, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  8, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  9, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 10, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 11, 14, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 12, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  1, 11, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  2, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  3, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  5, 15, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  6, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  7, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  8, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  9, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 10, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 11, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 12, 11, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  1, 15, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  2, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  3, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  5, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  6, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  7, 15, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  8, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  9, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 10, 24, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 12, 18, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  1, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  2, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  3, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  5, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  7, 14, 12, 30))
+    // FOMC: решение 14:00 ET, прессконф +30 мин
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  6, 16, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  7, 28, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  9, 22, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021, 11,  3, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021, 12, 15, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  1, 26, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  3, 16, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  5,  4, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  6, 15, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  7, 27, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  9, 21, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 11,  2, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 12, 14, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  2,  1, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  3, 22, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  5,  3, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  6, 14, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  7, 26, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  9, 20, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 11,  1, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 12, 13, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  1, 31, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  3, 20, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  5,  1, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  6, 12, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  7, 31, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  9, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 11,  7, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 12, 18, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  1, 29, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  3, 19, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  5,  7, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  6, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  7, 30, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  9, 17, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 10, 29, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 12, 10, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  1, 28, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  3, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  4, 29, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  6, 17, 18,  0))
+    // ЕЦБ до июля 2022: решение 13:45, прессконф 14:30 CET/CEST
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 22, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 22, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  9, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  9, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 28, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 28, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 16, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 16, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  3, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 14, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  9, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  9, 12, 30))
+    // ЕЦБ с июля 2022: решение 14:15 CET/CEST, прессконф +30 мин
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  7, 21, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  9,  8, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 10, 27, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 12, 15, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  2,  2, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  3, 16, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  5,  4, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  6, 15, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  7, 27, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  9, 14, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 10, 26, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 12, 14, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  1, 25, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  3,  7, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  4, 11, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  6,  6, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  7, 18, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  9, 12, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 10, 17, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 12, 12, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  1, 30, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  3,  6, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  4, 17, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  6,  5, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  7, 24, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  9, 11, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 10, 30, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 12, 18, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  2,  5, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  3, 19, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  4, 30, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  6, 11, 12, 15))
+    array.sort(newsTs, order.ascending)
+
+newsWinMs = newsWin * 60 * 1000
+f_newsBlocked() =>
+    bool blk = false
+    if newsMode > 0 and array.size(newsTs) > 0
+        for i = 0 to array.size(newsTs) - 1
+            int ts = array.get(newsTs, i)
+            if newsMode == 1
+                if ts > time + 86400000
+                    break
+                if year(time, "GMT") == year(ts, "GMT") and month(time, "GMT") == month(ts, "GMT") and dayofmonth(time, "GMT") == dayofmonth(ts, "GMT")
+                    blk := true
+                    break
+            else
+                if ts - newsWinMs > time_close
+                    break
+                if time_close <= ts + newsWinMs
+                    blk := true
+                    break
+    blk
+newsBlk = f_newsBlocked()
+
+// ───── Структура контекста + FTA + ликвидность (только закрытые бары HTF)
+f_htf() =>
+    fh = ta.pivothigh(high, frH, frH)
+    fl = ta.pivotlow(low, frH, frH)
+    a  = ta.atr(14)
+    var float lastFH = na
+    var float lastFL = na
+    var bool upBroken = true
+    var bool dnBroken = true
+    var int cntUp = 0
+    var int cntDn = 0
+    var int trendDir = 0
+    var int bLeg = 0
+    var int sLeg = 0
+    var float bFvgT = na
+    var float bFvgB = na
+    var float bObT  = na
+    var float bObB  = na
+    var float bSwp  = na
+    var float sFvgT = na
+    var float sFvgB = na
+    var float sObT  = na
+    var float sObB  = na
+    var float sSwp  = na
+    var array<float> bearB = array.new<float>()
+    var array<float> bearT = array.new<float>()
+    var array<float> bullB = array.new<float>()
+    var array<float> bullT = array.new<float>()
+    var array<float> liqH = array.new<float>()
+    var array<float> liqL = array.new<float>()
+    if high < low[2]
+        array.push(bearB, high)
+        array.push(bearT, low[2])
+        if array.size(bearB) > 30
+            array.shift(bearB)
+            array.shift(bearT)
+    if low > high[2]
+        array.push(bullB, high[2])
+        array.push(bullT, low)
+        if array.size(bullB) > 30
+            array.shift(bullB)
+            array.shift(bullT)
+    if not na(fh)
+        lastFH := fh
+        upBroken := false
+        array.push(liqH, fh)
+        if array.size(liqH) > 20
+            array.shift(liqH)
+    if not na(fl)
+        lastFL := fl
+        dnBroken := false
+        array.push(liqL, fl)
+        if array.size(liqL) > 20
+            array.shift(liqL)
+    if array.size(bearB) > 0
+        for i = array.size(bearB) - 1 to 0
+            if high >= (array.get(bearB, i) + array.get(bearT, i)) / 2
+                array.remove(bearB, i)
+                array.remove(bearT, i)
+    if array.size(bullB) > 0
+        for i = array.size(bullB) - 1 to 0
+            if low <= (array.get(bullB, i) + array.get(bullT, i)) / 2
+                array.remove(bullB, i)
+                array.remove(bullT, i)
+    if array.size(liqH) > 0
+        for i = array.size(liqH) - 1 to 0
+            if high > array.get(liqH, i)
+                array.remove(liqH, i)
+    if array.size(liqL) > 0
+        for i = array.size(liqL) - 1 to 0
+            if low < array.get(liqL, i)
+                array.remove(liqL, i)
+    float ftaUp = na
+    float ftaDn = na
+    if array.size(bearB) > 0
+        for i = 0 to array.size(bearB) - 1
+            lvA = array.get(bearB, i)
+            if lvA > close and (na(ftaUp) or lvA < ftaUp)
+                ftaUp := lvA
+    if array.size(bullB) > 0
+        for i = 0 to array.size(bullB) - 1
+            lvD = array.get(bullT, i)
+            if lvD < close and (na(ftaDn) or lvD > ftaDn)
+                ftaDn := lvD
+    var array<float> upsT = array.new<float>()
+    var array<float> dnsT = array.new<float>()
+    array.clear(upsT)
+    array.clear(dnsT)
+    if array.size(liqH) > 0
+        for i = 0 to array.size(liqH) - 1
+            lvE = array.get(liqH, i)
+            if lvE > close
+                array.push(upsT, lvE)
+    if array.size(liqL) > 0
+        for i = 0 to array.size(liqL) - 1
+            lvF = array.get(liqL, i)
+            if lvF < close
+                array.push(dnsT, lvF)
+    array.sort(upsT, order.ascending)
+    array.sort(dnsT, order.descending)
+    float liqUp = array.size(upsT) > 0 ? array.get(upsT, 0) : na
+    float liqUp2 = array.size(upsT) > 1 ? array.get(upsT, 1) : na
+    float liqUp3 = array.size(upsT) > 2 ? array.get(upsT, 2) : na
+    float liqDn = array.size(dnsT) > 0 ? array.get(dnsT, 0) : na
+    float liqDn2 = array.size(dnsT) > 1 ? array.get(dnsT, 1) : na
+    float liqDn3 = array.size(dnsT) > 2 ? array.get(dnsT, 2) : na
+    if ftaLiq
+        if not na(liqUp) and (na(ftaUp) or liqUp < ftaUp)
+            ftaUp := liqUp
+        if not na(liqDn) and (na(ftaDn) or liqDn > ftaDn)
+            ftaDn := liqDn
+    bosUp = not upBroken and not na(lastFH) and close > lastFH
+    bosDn = not dnBroken and not na(lastFL) and close < lastFL
+    if bosUp
+        upBroken := true
+        cntUp += 1
+        bLeg := trendDir == 1 ? bLeg + 1 : 1
+        trendDir := 1
+        bFvgT := na
+        bFvgB := na
+        bObT := na
+        bObB := na
+        for i = 0 to 14
+            if low[i] > high[i + 2]
+                bFvgT := low[i]
+                bFvgB := high[i + 2]
+                break
+        for i = 1 to 20
+            if close[i] < open[i]
+                bObT := high[i]
+                bObB := low[i]
+                break
+        bSwp := lastFL
+    if bosDn
+        dnBroken := true
+        cntDn += 1
+        sLeg := trendDir == -1 ? sLeg + 1 : 1
+        trendDir := -1
+        sFvgT := na
+        sFvgB := na
+        sObT := na
+        sObB := na
+        for i = 0 to 14
+            if high[i] < low[i + 2]
+                sFvgT := low[i + 2]
+                sFvgB := high[i]
+                break
+        for i = 1 to 20
+            if close[i] > open[i]
+                sObT := high[i]
+                sObB := low[i]
+                break
+        sSwp := lastFH
+    [cntUp[1], cntDn[1], lastFH[1], lastFL[1], a[1], bLeg[1], sLeg[1], bFvgT[1], bFvgB[1], bObT[1], bObB[1], bSwp[1], sFvgT[1], sFvgB[1], sObT[1], sObB[1], sSwp[1], ftaUp[1], ftaDn[1], liqUp[1], liqDn[1], liqUp2[1], liqDn2[1], liqUp3[1], liqDn3[1]]
+
+[hCntUp, hCntDn, hFH, hFL, hATR, hBLeg, hSLeg, hFvgTB, hFvgBB, hObTB, hObBB, hSwpB, hFvgTS, hFvgBS, hObTS, hObBS, hSwpS, hFtaUp, hFtaDn, hLiqUp, hLiqDn, hLiqUp2, hLiqDn2, hLiqUp3, hLiqDn3] =
+     request.security(syminfo.tickerid, htfTF, f_htf(), lookahead = barmerge.lookahead_on)
+
+// ───── Фракталы ТФ входа
+pfh = ta.pivothigh(high, frL, frL)
+pfl = ta.pivotlow(low, frL, frL)
+var float mFH = na
+var float mFL = na
+if not na(pfh)
+    mFH := pfh
+if not na(pfl)
+    mFL := pfl
+
+newBosUp = hCntUp > nz(hCntUp[1])
+newBosDn = hCntDn > nz(hCntDn[1])
+
+// ───── DEBUG счётчики
+var int dbgBosUp = 0
+var int dbgBosDn = 0
+var int dbgSkipL = 0
+var int dbgSkipS = 0
+var int dbgZoneL = 0
+var int dbgSwpL  = 0
+var int dbgEntL  = 0
+var int dbgZoneS = 0
+var int dbgSwpS  = 0
+var int dbgEntS  = 0
+var int dbgKillL = 0
+var int dbgKillS = 0
+var int dbgSessL = 0
+var int dbgSessS = 0
+var int dbgFtaL  = 0
+var int dbgFtaS  = 0
+var int dbgBeCnt = 0
+var int dbgTpL   = 0
+var int dbgTpS   = 0
+var int dbgNewsL = 0
+var int dbgNewsS = 0
+var int dbgBandL = 0
+var int dbgBandS = 0
+
+// ───── Трекинг текущей сделки
+var int   tDir = 0
+var int   tBar = na
+var float tEntry = na
+var float tSL = na
+var float tTP = na
+var float eFta = na
+var bool  eBE = false
+
+// ═════ LONG
+var int   stL = 0
+var float LfvgT = na
+var float LfvgB = na
+var float LobT = na
+var float LobB = na
+var float LswpLvl = na
+var float LinvLvl = na
+var int   LexpT = na
+var float LsweepLow = na
+var float LbosLvl = na
+
+if tradeLong and newBosUp
+    dbgBosUp += 1
+    if hBLeg > maxBos
+        dbgSkipL += 1
+    else
+        LfvgT := useFVG ? hFvgTB : na
+        LfvgB := useFVG ? hFvgBB : na
+        LobT  := useOB ? hObTB : na
+        LobB  := useOB ? hObBB : na
+        LswpLvl := useSWP ? hSwpB : na
+        LinvLvl := hFL
+        LexpT := time + poiLifeH * htfMs
+        LsweepLow := na
+        LbosLvl := na
+        stL := (not na(LfvgT) or not na(LobT) or not na(LswpLvl)) ? 1 : 0
+        if showZones and stL == 1
+            rB = bar_index + poiLifeH * barsPerHtf
+            if not na(LfvgT)
+                box.new(bar_index, LfvgT, rB, LfvgB, border_color=color.new(color.teal, 40), bgcolor=color.new(color.teal, 88))
+            if not na(LobT)
+                box.new(bar_index, LobT, rB, LobB, border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 90))
+            if not na(LswpLvl)
+                line.new(bar_index, LswpLvl, rB, LswpLvl, color=color.new(color.orange, 20), style=line.style_dashed)
+
+if stL > 0 and (newBosDn or time > LexpT or close < LinvLvl - 0.5 * hATR)
+    stL := 0
+    dbgKillL += 1
+
+inZoneL = (not na(LfvgT) and low <= LfvgT) or (not na(LobT) and low <= LobT) or (not na(LswpLvl) and low <= LswpLvl)
+if stL == 1 and inZoneL
+    stL := 2
+    LsweepLow := low
+    dbgZoneL += 1
+if stL >= 2
+    LsweepLow := math.min(LsweepLow, low)
+if stL == 2 and not na(mFL) and low < mFL and close > mFL
+    stL := 3
+    LbosLvl := mFH
+    dbgSwpL += 1
+if stL == 3 and not na(LbosLvl) and close > LbosLvl and strategy.position_size == 0
+    if not inSess
+        dbgSessL += 1
+    else if newsBlk
+        dbgNewsL += 1
+    else
+        stopP = LsweepLow
+        riskD = close - stopP
+        stopPipL = riskD / pipSz
+        bool bandBlkL = useAtrBand ? (riskD < atrBandMin * hATR or riskD > atrBandMax * hATR) : useStopBand and (stopPipL < minStopPip or stopPipL > maxStopPip)
+        if bandBlkL
+            dbgBandL += 1
+        else if riskD > syminfo.mintick * 5
+            float tpP = close + rrMult * riskD
+            bool okT = true
+            if tpLiq
+                float bestTp = na
+                if not na(hLiqUp) and (hLiqUp - tpBuf * syminfo.mintick - close) / riskD >= tpMinR
+                    bestTp := hLiqUp - tpBuf * syminfo.mintick
+                else if not na(hLiqUp2) and (hLiqUp2 - tpBuf * syminfo.mintick - close) / riskD >= tpMinR
+                    bestTp := hLiqUp2 - tpBuf * syminfo.mintick
+                else if not na(hLiqUp3) and (hLiqUp3 - tpBuf * syminfo.mintick - close) / riskD >= tpMinR
+                    bestTp := hLiqUp3 - tpBuf * syminfo.mintick
+                if not na(bestTp)
+                    tpP := bestTp
+                else
+                    dbgTpL += 1
+            if useFta and not na(hFtaUp) and hFtaUp - close < ftaMinR * riskD
+                okT := false
+                dbgFtaL += 1
+            if okT
+                qty = (riskComp ? strategy.equity : strategy.initial_capital) * riskPct / 100 / riskD
+                strategy.entry("Long", strategy.long, qty=qty)
+                strategy.exit("Long TP/SL", "Long", stop=stopP, limit=tpP)
+                dbgEntL += 1
+                tDir := 1
+                tBar := bar_index
+                tEntry := close
+                tSL := stopP
+                tTP := tpP
+                eFta := hFtaUp
+                eBE := false
+    stL := 0
+
+// ═════ SHORT
+var int   stS = 0
+var float SfvgT = na
+var float SfvgB = na
+var float SobT = na
+var float SobB = na
+var float SswpLvl = na
+var float SinvLvl = na
+var int   SexpT = na
+var float SsweepHigh = na
+var float SbosLvl = na
+
+if tradeShort and newBosDn
+    dbgBosDn += 1
+    if hSLeg > maxBos
+        dbgSkipS += 1
+    else
+        SfvgT := useFVG ? hFvgTS : na
+        SfvgB := useFVG ? hFvgBS : na
+        SobT  := useOB ? hObTS : na
+        SobB  := useOB ? hObBS : na
+        SswpLvl := useSWP ? hSwpS : na
+        SinvLvl := hFH
+        SexpT := time + poiLifeH * htfMs
+        SsweepHigh := na
+        SbosLvl := na
+        stS := (not na(SfvgT) or not na(SobT) or not na(SswpLvl)) ? 1 : 0
+        if showZones and stS == 1
+            rS = bar_index + poiLifeH * barsPerHtf
+            if not na(SfvgT)
+                box.new(bar_index, SfvgT, rS, SfvgB, border_color=color.new(color.maroon, 40), bgcolor=color.new(color.red, 90))
+            if not na(SobT)
+                box.new(bar_index, SobT, rS, SobB, border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 92))
+            if not na(SswpLvl)
+                line.new(bar_index, SswpLvl, rS, SswpLvl, color=color.new(color.orange, 20), style=line.style_dashed)
+
+if stS > 0 and (newBosUp or time > SexpT or close > SinvLvl + 0.5 * hATR)
+    stS := 0
+    dbgKillS += 1
+
+inZoneS = (not na(SfvgB) and high >= SfvgB) or (not na(SobB) and high >= SobB) or (not na(SswpLvl) and high >= SswpLvl)
+if stS == 1 and inZoneS
+    stS := 2
+    SsweepHigh := high
+    dbgZoneS += 1
+if stS >= 2
+    SsweepHigh := math.max(SsweepHigh, high)
+if stS == 2 and not na(mFH) and high > mFH and close < mFH
+    stS := 3
+    SbosLvl := mFL
+    dbgSwpS += 1
+if stS == 3 and not na(SbosLvl) and close < SbosLvl and strategy.position_size == 0
+    if not inSess
+        dbgSessS += 1
+    else if newsBlk
+        dbgNewsS += 1
+    else
+        stopS = SsweepHigh
+        riskDS = stopS - close
+        stopPipS = riskDS / pipSz
+        bool bandBlkS = useAtrBand ? (riskDS < atrBandMin * hATR or riskDS > atrBandMax * hATR) : useStopBand and (stopPipS < minStopPip or stopPipS > maxStopPip)
+        if bandBlkS
+            dbgBandS += 1
+        else if riskDS > syminfo.mintick * 5
+            float tpPS = close - rrMult * riskDS
+            bool okTS = true
+            if tpLiq
+                float bestTpS = na
+                if not na(hLiqDn) and (close - (hLiqDn + tpBuf * syminfo.mintick)) / riskDS >= tpMinR
+                    bestTpS := hLiqDn + tpBuf * syminfo.mintick
+                else if not na(hLiqDn2) and (close - (hLiqDn2 + tpBuf * syminfo.mintick)) / riskDS >= tpMinR
+                    bestTpS := hLiqDn2 + tpBuf * syminfo.mintick
+                else if not na(hLiqDn3) and (close - (hLiqDn3 + tpBuf * syminfo.mintick)) / riskDS >= tpMinR
+                    bestTpS := hLiqDn3 + tpBuf * syminfo.mintick
+                if not na(bestTpS)
+                    tpPS := bestTpS
+                else
+                    dbgTpS += 1
+            if useFta and not na(hFtaDn) and close - hFtaDn < ftaMinR * riskDS
+                okTS := false
+                dbgFtaS += 1
+            if okTS
+                qtyS = (riskComp ? strategy.equity : strategy.initial_capital) * riskPct / 100 / riskDS
+                strategy.entry("Short", strategy.short, qty=qtyS)
+                strategy.exit("Short TP/SL", "Short", stop=stopS, limit=tpPS)
+                dbgEntS += 1
+                tDir := -1
+                tBar := bar_index
+                tEntry := close
+                tSL := stopS
+                tTP := tpPS
+                eFta := hFtaDn
+                eBE := false
+    stS := 0
+
+// ───── Безубыток при касании FTA (актив только при useFta)
+if useFta and strategy.position_size > 0 and not eBE and not na(eFta) and high >= eFta
+    strategy.exit("Long TP/SL", "Long", stop=tEntry, limit=tTP)
+    eBE := true
+    dbgBeCnt += 1
+if useFta and strategy.position_size < 0 and not eBE and not na(eFta) and low <= eFta
+    strategy.exit("Short TP/SL", "Short", stop=tEntry, limit=tTP)
+    eBE := true
+    dbgBeCnt += 1
+
+// ───── Отрисовка закрытой сделки
+closedNow = strategy.closedtrades > nz(strategy.closedtrades[1])
+if showTrades and closedNow and not na(tBar) and tDir != 0
+    if tDir == 1
+        box.new(tBar, tTP, bar_index, tEntry, border_color=color.new(color.green, 45), bgcolor=color.new(color.green, 80))
+        box.new(tBar, tEntry, bar_index, tSL, border_color=color.new(color.red, 45), bgcolor=color.new(color.red, 80))
+        label.new(tBar, tSL, "LONG " + str.tostring(tEntry, format.mintick), style=label.style_label_up, color=color.new(color.green, 60), textcolor=color.white, size=size.small)
+    else
+        box.new(tBar, tEntry, bar_index, tTP, border_color=color.new(color.green, 45), bgcolor=color.new(color.green, 80))
+        box.new(tBar, tSL, bar_index, tEntry, border_color=color.new(color.red, 45), bgcolor=color.new(color.red, 80))
+        label.new(tBar, tSL, "SHORT " + str.tostring(tEntry, format.mintick), style=label.style_label_down, color=color.new(color.red, 60), textcolor=color.white, size=size.small)
+    tDir := 0
+    tBar := na
+if closedNow
+    eBE := false
+    eFta := na
+
+// ───── Таблица статистики + DEBUG
+var table tbl = table.new(position.top_right, 2, 19, bgcolor=color.new(#131722, 10), border_width=1, border_color=color.new(color.gray, 60))
+if barstate.islastconfirmedhistory or barstate.islast
+    total = strategy.closedtrades
+    wins  = strategy.wintrades
+    wr    = total > 0 ? 100.0 * wins / total : 0.0
+    pf    = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    txt   = color.white
+    string bandTxt = useAtrBand ? ("ATR " + str.tostring(atrBandMin, "#.#") + "–" + str.tostring(atrBandMax, "#.#") + " (~" + str.tostring(atrBandMin * hATR / pipSz, "#") + "–" + str.tostring(atrBandMax * hATR / pipSz, "#") + "п)") : useStopBand ? (str.tostring(minStopPip, "#") + "–" + str.tostring(maxStopPip, "#") + "п") : "OFF"
+    color bandCol = (useAtrBand or useStopBand) ? color.lime : color.gray
+    table.cell(tbl, 0, 0, "SMC v11 atrband " + htfTF + "→" + timeframe.period, text_color=color.orange, text_size=size.small)
+    table.cell(tbl, 1, 0, syminfo.ticker, text_color=color.orange, text_size=size.small)
+    table.cell(tbl, 0, 1, "Сделок", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 1, str.tostring(total), text_color=txt, text_size=size.small)
+    table.cell(tbl, 0, 2, "Winrate", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(wr, "#.#") + " %", text_color=txt, text_size=size.small)
+    table.cell(tbl, 0, 3, "Profit Factor", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 3, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color=txt, text_size=size.small)
+    table.cell(tbl, 0, 4, "Net Profit", text_color=strategy.netprofit >= 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(tbl, 1, 4, str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? color.lime : color.red, text_size=size.small)
+    table.cell(tbl, 0, 5, "Новости: режим / окно", text_color=newsMode > 0 ? color.lime : color.gray, text_size=size.small)
+    table.cell(tbl, 1, 5, (newsMode == 0 ? "OFF" : newsMode == 1 ? "ДЕНЬ" : "±" + str.tostring(newsWin) + "м"), text_color=newsMode > 0 ? color.lime : color.gray, text_size=size.small)
+    table.cell(tbl, 0, 6, "Стоп-коридор | блок L/S", text_color=bandCol, text_size=size.small)
+    table.cell(tbl, 1, 6, bandTxt + " | " + str.tostring(dbgBandL) + " / " + str.tostring(dbgBandS), text_color=bandCol, text_size=size.small)
+    table.cell(tbl, 0, 7, "DBG BOS evt L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 7, str.tostring(dbgBosUp) + " / " + str.tostring(dbgBosDn), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 8, "DBG пропуск колен L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 8, str.tostring(dbgSkipL) + " / " + str.tostring(dbgSkipS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 9, "DBG в зоне L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 9, str.tostring(dbgZoneL) + " / " + str.tostring(dbgZoneS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 10, "DBG свип L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 10, str.tostring(dbgSwpL) + " / " + str.tostring(dbgSwpS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 11, "DBG вход L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 11, str.tostring(dbgEntL) + " / " + str.tostring(dbgEntS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 12, "DBG TP<минRR пропуск L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 12, str.tostring(dbgTpL) + " / " + str.tostring(dbgTpS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 13, "DBG отмена вне сессии L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 13, str.tostring(dbgSessL) + " / " + str.tostring(dbgSessS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 14, "DBG новости пропуск L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 14, str.tostring(dbgNewsL) + " / " + str.tostring(dbgNewsS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 15, "DBG отмена (структура/время) L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 15, str.tostring(dbgKillL) + " / " + str.tostring(dbgKillS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 16, "DBG FTA-пропуск L/S", text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 1, 16, str.tostring(dbgFtaL) + " / " + str.tostring(dbgFtaS), text_color=color.yellow, text_size=size.small)
+    table.cell(tbl, 0, 17, "TP-ликва / мин.RR", text_color=txt, text_size=size.small)
+    table.cell(tbl, 1, 17, (tpLiq ? "ON" : "OFF") + " / " + str.tostring(tpMinR, "#.##"), text_color=tpLiq ? color.lime : color.gray, text_size=size.small)
+    table.cell(tbl, 0, 18, "Ликва сейчас ↑/↓", text_color=color.aqua, text_size=size.small)
+    table.cell(tbl, 1, 18, str.tostring(hLiqUp, format.mintick) + " / " + str.tostring(hLiqDn, format.mintick), text_color=color.aqua, text_size=size.small)

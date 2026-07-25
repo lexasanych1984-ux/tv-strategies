@@ -1,0 +1,742 @@
+//@version=6
+strategy("CRT Day 1H Strategy v1", "CRTS v1", overlay = true, initial_capital = 100000, pyramiding = 0,
+     margin_long = 0, margin_short = 0,
+     max_labels_count = 500, max_boxes_count = 500, max_lines_count = 500)
+
+bool dbg = input.bool(true, "Отладка: метки исходов по дням", group = "Отладка")
+int dbgFrom = input.time(timestamp("10 Mar 2026 00:00 +0000"), "Отладка: старт детального лога", group = "Отладка")
+bool dbgTrace = input.bool(false, "Отладка: лог касаний/сбросов (48ч от старта)", group = "Отладка")
+
+// ================= ИНПУТЫ =================
+bool useOB   = input.bool(true,  "D1 POI: ордер-блок", group = "Дневной фильтр POI")
+bool useFVG  = input.bool(true,  "D1 POI: FVG", group = "Дневной фильтр POI")
+bool useLIQ  = input.bool(true,  "D1 POI: ликвидность (pivot)", group = "Дневной фильтр POI")
+int  pivL    = input.int(3, "Pivot: дней слева", minval = 1, group = "Дневной фильтр POI")
+
+bool useH1FVG = input.bool(true, "H1 зона: FVG", group = "Вход H1")
+bool useH1OB  = input.bool(true, "H1 зона: ордер-блок", group = "Вход H1")
+int  h1MaxAge = input.int(72, "Макс. возраст H1 зоны (баров)", minval = 6, group = "Вход H1")
+string sess   = input.session("1000-2300", "Окно пробоя (рабочее время)", group = "Вход H1")
+string protMode = input.string("range", "Проторговка", options = ["range", "pause"], tooltip = "range: диапазон дня до касания зоны, вход на пробое его края. pause: бегущий экстремум, вход после паузы импульса", group = "Вход H1")
+string nightMode = input.string("dead", "Ночной пробой проторговки", options = ["dead", "rearm", "limit"], tooltip = "dead: сетап сгорел. rearm: ждём новое касание и новую проторговку. limit: лимитный вход на уровне пробитого края (разрешён и ночью)", group = "Вход H1")
+string sessTz = input.string("Europe/Moscow", "Таймзона окна", group = "Вход H1")
+bool cancelBeyondManip = input.bool(true, "Отмена, если день закрепился за экстремумом манипуляции", group = "Вход H1")
+bool touchInSess = input.bool(false, "Касание зоны только в сессию", group = "Вход H1")
+
+float rrMult  = input.float(2.2, "RR (тейк = RR × риск)", step = 0.1, group = "Риск")
+float riskPct = input.float(1.0, "Риск на сделку, % от эквити", step = 0.25, group = "Риск")
+int  newsMode = input.int(0, "Красные новости: 0=выкл, 1=день без торговли, 2=окно ±мин", minval = 0, maxval = 2, group = "Фильтры")
+int  newsWin  = input.int(60, "Окно вокруг новости, мин (режим 2)", minval = 5, step = 5, group = "Фильтры")
+bool nightOff = input.bool(false, "Не торговать ночью (вся механика только в рабочем окне)", group = "Фильтры")
+bool reentryBE = input.bool(false, "Перезаход: выход вчерашней позиции (БУ) не блокирует день", group = "Фильтры")
+string crtClose = input.string("inside", "Закрытие манипуляции", options = ["inside", "beyond", "any"], tooltip = "inside: возврат внутрь диапазона (классика). beyond: закрытие за свипнутым экстремумом. any: оба", group = "Вариации")
+string stopMode = input.string("dayExt", "Стоп", options = ["dayExt", "h1zone"], tooltip = "dayExt: за экстремум дня. h1zone: за границу H1-зоны касания", group = "Вариации")
+int minRangeBars = input.int(1, "Мин. баров проторговки до касания", minval = 1, group = "Вариации")
+bool entryInPrevRange = input.bool(false, "Вход внутри диапазона пред. дня (лонг ≥ лоу, шорт ≤ хай)", group = "Вариации")
+
+// ================= ДНЕВНОЙ СЛОЙ (порт v0.2) =================
+var float d0o = na
+var float d0h = na
+var float d0l = na
+var float d0c = na
+var float d1o = na
+var float d1h = na
+var float d1l = na
+var float d1c = na
+var float d2h = na
+var float d2l = na
+
+bool newDay = ta.change(time("D")) != 0
+
+var array<float> Do = array.new_float()
+var array<float> Dh = array.new_float()
+var array<float> Dl = array.new_float()
+var array<float> Dc = array.new_float()
+
+type Zone
+    float top
+    float bot
+    int   dir
+    int   kind  // 1=OB, 2=FVG
+    int   born
+
+var array<Zone> zones  = array.new<Zone>()   // дневные POI
+var array<Zone> hzones = array.new<Zone>()   // часовые зоны реакции
+
+type Liq
+    float lvl
+    int   dir
+
+var array<Liq> liqs = array.new<Liq>()
+
+var int bearClStart = -1
+var int bullClStart = -1
+
+f_clHigh(int fromIdx, int toIdx) =>
+    float m = -1.0e18
+    for i = fromIdx to toIdx
+        m := math.max(m, array.get(Dh, i))
+    m
+
+f_clLow(int fromIdx, int toIdx) =>
+    float m = 1.0e18
+    for i = fromIdx to toIdx
+        m := math.min(m, array.get(Dl, i))
+    m
+
+// ================= СОСТОЯНИЕ ТОРГОВОГО ДНЯ =================
+var int   tDir = 0
+var float tD1h = na
+var float tD1l = na
+var bool  touched = false
+var bool  paused = false
+var float entryLvl = na
+var float dayExt = na
+var bool  setupDead = false
+var bool  tradeDone = false
+var float curSL = na
+var float curTP = na
+var bool  beDone = false
+var bool  dayBlocked = false
+var int   poiS = 0
+var int   poiL = 0
+var int   cntEnt = 0
+var int   cntBlk = 0
+var int   cntDead = 0
+var int   cntTch = 0
+var int   cntNoTch = 0
+var int   barsInPos = 0
+var float entPx = na
+var float entSL = na
+var float entTP = na
+var int   cntTP = 0
+var int   cntBE = 0
+var int   cntSL = 0
+
+bool inSession = not na(time(timeframe.period, sess, sessTz))
+// начнётся ли СЛЕДУЮЩИЙ бар в сессии (ордер, выставленный на закрытии текущего, живёт в следующем)
+int sessStartH = int(str.tonumber(str.substring(sess, 0, 2)))
+int sessEndH = int(str.tonumber(str.substring(sess, 5, 7)))
+int nextH = hour(time_close, sessTz)
+bool nextInSess = sessStartH <= sessEndH ? (nextH >= sessStartH and nextH < sessEndH) : (nextH >= sessStartH or nextH < sessEndH)
+var bool orderLive = false
+var bool limitArmed = false
+var bool posFromPrevDay = false
+var float touchZBound = na  // граница H1-зоны касания (стоп в режиме h1zone)
+var int rngBars = 0         // баров проторговки до касания
+
+// ───── Красные новости: NFP, CPI США, FOMC (решение+прессконф), ЕЦБ (решение+прессконф), UTC
+// Покрытие: июнь 2021 – июль 2026 (для 5-летних реплей-прогонов)
+var array<int> newsTs = array.new<int>()
+
+// решение + прессконференция через 30 мин
+f_pushEvt(array<int> arr, int ts) =>
+    array.push(arr, ts)
+    array.push(arr, ts + 1800000)
+
+if barstate.isfirst
+    // NFP, 8:30 ET
+    array.push(newsTs, timestamp("GMT", 2021,  6,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  8,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 11,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  1,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  4, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3,  4, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  5,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  7,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  8,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  9,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 10,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 11,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 12,  2, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  1,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  2,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  4,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  5,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  6,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  7,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  8,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  9,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 10,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 11,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 12,  8, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  1,  5, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  2,  2, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  3,  8, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  4,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  5,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  6,  7, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  7,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  8,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  9,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 10,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 11,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 12,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  1, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  2,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  3,  7, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  4,  4, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  5,  2, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  6,  6, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  7,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  8,  1, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  9,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 11, 20, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 12, 16, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  1,  9, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  2,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  3,  6, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  4,  3, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  5,  8, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  6,  5, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  7,  2, 12, 30))
+    // CPI США, 8:30 ET
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  8, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 11, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  1, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  5, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  7, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  8, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  9, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 10, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 11, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022, 12, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  1, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  2, 14, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  3, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  4, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  5, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  6, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  7, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  8, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023,  9, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 10, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 11, 14, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2023, 12, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  1, 11, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  2, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  3, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  5, 15, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  6, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  7, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  8, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024,  9, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 10, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 11, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2024, 12, 11, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  1, 15, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  2, 12, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  3, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  5, 13, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  6, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  7, 15, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  8, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025,  9, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 10, 24, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2025, 12, 18, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  1, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  2, 13, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  3, 11, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  4, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  5, 12, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2026,  7, 14, 12, 30))
+    // FOMC: решение 14:00 ET, прессконф +30 мин
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  6, 16, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  7, 28, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021,  9, 22, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021, 11,  3, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2021, 12, 15, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  1, 26, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  3, 16, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  5,  4, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  6, 15, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  7, 27, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  9, 21, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 11,  2, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 12, 14, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  2,  1, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  3, 22, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  5,  3, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  6, 14, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  7, 26, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  9, 20, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 11,  1, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 12, 13, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  1, 31, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  3, 20, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  5,  1, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  6, 12, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  7, 31, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  9, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 11,  7, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 12, 18, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  1, 29, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  3, 19, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  5,  7, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  6, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  7, 30, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  9, 17, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 10, 29, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 12, 10, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  1, 28, 19,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  3, 18, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  4, 29, 18,  0))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  6, 17, 18,  0))
+    // ЕЦБ до июля 2022: решение 13:45, прессконф 14:30 CET/CEST
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  6, 10, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 22, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  7, 22, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  9, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021,  9,  9, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 28, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2021, 10, 28, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 16, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2021, 12, 16, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  3, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  2,  3, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 12, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  3, 10, 13, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 14, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  4, 14, 12, 30))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  9, 11, 45))
+    array.push(newsTs, timestamp("GMT", 2022,  6,  9, 12, 30))
+    // ЕЦБ с июля 2022: решение 14:15 CET/CEST, прессконф +30 мин
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  7, 21, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022,  9,  8, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 10, 27, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2022, 12, 15, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  2,  2, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  3, 16, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  5,  4, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  6, 15, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  7, 27, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023,  9, 14, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 10, 26, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2023, 12, 14, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  1, 25, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  3,  7, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  4, 11, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  6,  6, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  7, 18, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024,  9, 12, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 10, 17, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2024, 12, 12, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  1, 30, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  3,  6, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  4, 17, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  6,  5, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  7, 24, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025,  9, 11, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 10, 30, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2025, 12, 18, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  2,  5, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  3, 19, 13, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  4, 30, 12, 15))
+    f_pushEvt(newsTs, timestamp("GMT", 2026,  6, 11, 12, 15))
+    array.sort(newsTs, order.ascending)
+
+newsWinMs = newsWin * 60 * 1000
+f_newsBlocked() =>
+    bool blk = false
+    if newsMode > 0 and array.size(newsTs) > 0
+        for i = 0 to array.size(newsTs) - 1
+            int ts = array.get(newsTs, i)
+            if newsMode == 1
+                if ts > time + 86400000
+                    break
+                if year(time, "GMT") == year(ts, "GMT") and month(time, "GMT") == month(ts, "GMT") and dayofmonth(time, "GMT") == dayofmonth(ts, "GMT")
+                    blk := true
+                    break
+            else
+                if ts - newsWinMs > time_close
+                    break
+                if time_close <= ts + newsWinMs
+                    blk := true
+                    break
+    blk
+newsBlk = f_newsBlocked()
+
+
+if barstate.isfirst
+    d0o := open
+    d0h := high
+    d0l := low
+    d0c := close
+
+if newDay and not barstate.isfirst
+    // ---- итог вчерашнего сетапа (отладка)
+    if tDir != 0
+        string oc = tradeDone ? "ENT" : dayBlocked ? "BLK" : setupDead ? "DEAD" : touched ? "TCH" : "NOTCH"
+        if oc == "ENT"
+            cntEnt += 1
+        if oc == "BLK"
+            cntBlk += 1
+        if oc == "DEAD"
+            cntDead += 1
+        if oc == "TCH"
+            cntTch += 1
+        if oc == "NOTCH"
+            cntNoTch += 1
+        if dbg
+            string extra = oc == "ENT" ? " e" + str.tostring(entPx, format.mintick) + " sl" + str.tostring(entSL, format.mintick) + " tp" + str.tostring(entTP, format.mintick) : ""
+            label.new(bar_index - 1, low, oc + " " + str.format_time(time("D")[1] + 12 * 3600 * 1000, "MM-dd", "UTC") + extra,
+                 style = label.style_label_up, color = oc == "ENT" ? color.new(color.blue, 30) : color.new(color.gray, 60),
+                 textcolor = color.white, size = size.tiny)
+    // ---- сдвиг дней
+    d2h := d1h
+    d2l := d1l
+    d1o := d0o
+    d1h := d0h
+    d1l := d0l
+    d1c := d0c
+    d0o := open
+    d0h := high
+    d0l := low
+    d0c := close
+    // ---- перевод в БУ: позиция пережила торговый день
+    posFromPrevDay := strategy.position_size != 0
+    if strategy.position_size != 0 and not beDone
+        curSL := strategy.position_avg_price
+        beDone := true
+    // ---- сброс дневного сетапа
+    tDir := 0
+    touched := false
+    paused := false
+    entryLvl := na
+    touchZBound := na
+    rngBars := 0
+    setupDead := false
+    tradeDone := false
+    orderLive := false
+    limitArmed := false
+    strategy.cancel_all()
+    // ---- CRT-тест (зоны в состоянии на конец дня-диапазона d2)
+    if not na(d2h)
+        bool shortCRT = d1h > d2h and d1l > d2l and (crtClose == "inside" ? d1c < d2h : crtClose == "beyond" ? d1c > d2h : true)
+        bool longCRT  = d1l < d2l and d1h < d2h and (crtClose == "inside" ? d1c > d2l : crtClose == "beyond" ? d1c < d2l : true)
+        int dir = shortCRT ? -1 : longCRT ? 1 : 0
+        if dir != 0
+            bool hitOB = false
+            bool hitFVG = false
+            bool hitLIQ = false
+            float tip = dir < 0 ? d1h : d1l
+            if array.size(zones) > 0
+                for i = 0 to array.size(zones) - 1
+                    Zone z = array.get(zones, i)
+                    if z.dir == dir and tip >= z.bot and tip <= z.top
+                        if z.kind == 1
+                            hitOB := true
+                        else
+                            hitFVG := true
+            if array.size(liqs) > 0
+                for i = 0 to array.size(liqs) - 1
+                    Liq q = array.get(liqs, i)
+                    if q.dir == dir
+                        if dir < 0 and d1h >= q.lvl and d1c < q.lvl
+                            hitLIQ := true
+                        if dir > 0 and d1l <= q.lvl and d1c > q.lvl
+                            hitLIQ := true
+            if (useOB and hitOB) or (useFVG and hitFVG) or (useLIQ and hitLIQ)
+                tDir := dir
+                tD1h := d1h
+                tD1l := d1l
+                dayExt := dir < 0 ? high : low
+                dayBlocked := strategy.position_size != 0
+                if dir < 0
+                    poiS += 1
+                else
+                    poiL += 1
+    // ---- применяем завершённый день d1 к дневным структурам
+    array.push(Do, d1o)
+    array.push(Dh, d1h)
+    array.push(Dl, d1l)
+    array.push(Dc, d1c)
+    int idx = array.size(Dh) - 1
+    float dh = d1h
+    float dl = d1l
+    float dc = d1c
+    bool dBull = d1c > d1o
+    bool dBear = d1c < d1o
+    if bearClStart >= 0 and idx > bearClStart
+        float ch = f_clHigh(bearClStart, idx - 1)
+        float cl = f_clLow(bearClStart, idx - 1)
+        if dc < cl
+            array.push(zones, Zone.new(ch, cl, -1, 1, idx))
+            bearClStart := dBull ? idx : -1
+        else if dc > ch
+            bearClStart := dBull ? idx : -1
+    if bearClStart < 0 and dBull
+        bearClStart := idx
+    if bullClStart >= 0 and idx > bullClStart
+        float ch2 = f_clHigh(bullClStart, idx - 1)
+        float cl2 = f_clLow(bullClStart, idx - 1)
+        if dc > ch2
+            array.push(zones, Zone.new(ch2, cl2, 1, 1, idx))
+            bullClStart := dBear ? idx : -1
+        else if dc < cl2
+            bullClStart := dBear ? idx : -1
+    if bullClStart < 0 and dBear
+        bullClStart := idx
+    if idx >= 2
+        float aH = array.get(Dh, idx - 2)
+        float aL = array.get(Dl, idx - 2)
+        if aL > dh
+            array.push(zones, Zone.new(aL, dh, -1, 2, idx))
+        if aH < dl
+            array.push(zones, Zone.new(dl, aH, 1, 2, idx))
+    if array.size(zones) > 0
+        for i = array.size(zones) - 1 to 0
+            Zone z = array.get(zones, i)
+            if z.dir == -1 ? dc > z.top : dc < z.bot
+                array.remove(zones, i)
+    int p = idx - 1
+    if p >= pivL
+        float ph = array.get(Dh, p)
+        float pl = array.get(Dl, p)
+        bool isPH = ph > dh
+        bool isPL = pl < dl
+        for k = 1 to pivL
+            isPH := isPH and ph > array.get(Dh, p - k)
+            isPL := isPL and pl < array.get(Dl, p - k)
+        if isPH
+            array.push(liqs, Liq.new(ph, -1))
+        if isPL
+            array.push(liqs, Liq.new(pl, 1))
+    if array.size(liqs) > 0
+        for i = array.size(liqs) - 1 to 0
+            Liq q = array.get(liqs, i)
+            if q.dir == -1 ? dh > q.lvl : dl < q.lvl
+                array.remove(liqs, i)
+else if not newDay
+    d0h := math.max(d0h, high)
+    d0l := math.min(d0l, low)
+    d0c := close
+
+// ================= ЧАСОВЫЕ ЗОНЫ (H1 FVG + H1 OB) =================
+var float hBearClHigh = na
+var float hBearClLow = na
+var float hBullClHigh = na
+var float hBullClLow = na
+
+// H1 OB: кластер контртрендовых свечей, валидация закрытием за экстремум
+if useH1OB
+    if not na(hBearClHigh)
+        if close < hBearClLow
+            array.push(hzones, Zone.new(hBearClHigh, hBearClLow, -1, 1, bar_index))
+            hBearClHigh := close > open ? high : na
+            hBearClLow := close > open ? low : na
+        else if close > hBearClHigh
+            hBearClHigh := close > open ? high : na
+            hBearClLow := close > open ? low : na
+        else
+            hBearClHigh := math.max(hBearClHigh, high)
+            hBearClLow := math.min(hBearClLow, low)
+    else if close > open
+        hBearClHigh := high
+        hBearClLow := low
+    if not na(hBullClHigh)
+        if close > hBullClHigh
+            array.push(hzones, Zone.new(hBullClHigh, hBullClLow, 1, 1, bar_index))
+            hBullClHigh := close < open ? high : na
+            hBullClLow := close < open ? low : na
+        else if close < hBullClLow
+            hBullClHigh := close < open ? high : na
+            hBullClLow := close < open ? low : na
+        else
+            hBullClHigh := math.max(hBullClHigh, high)
+            hBullClLow := math.min(hBullClLow, low)
+    else if close < open
+        hBullClHigh := high
+        hBullClLow := low
+
+// H1 FVG
+if useH1FVG and bar_index >= 2
+    if low[2] > high
+        array.push(hzones, Zone.new(low[2], high, -1, 2, bar_index))
+    if high[2] < low
+        array.push(hzones, Zone.new(low, high[2], 1, 2, bar_index))
+
+// инвалидация и старение H1 зон
+if array.size(hzones) > 0
+    for i = array.size(hzones) - 1 to 0
+        Zone z = array.get(hzones, i)
+        bool kill = (z.dir == -1 ? close > z.top : close < z.bot) or bar_index - z.born > h1MaxAge
+        if kill
+            array.remove(hzones, i)
+
+// ================= МЕХАНИКА ТОРГОВОГО ДНЯ =================
+if tDir != 0 and not tradeDone and (strategy.position_size == 0 or (reentryBE and posFromPrevDay)) and (not nightOff or inSession)
+    // экстремум дня (стоп «за большой OB»)
+    dayExt := tDir < 0 ? math.max(dayExt, high) : math.min(dayExt, low)
+    // отмена: день закрепился за экстремумом манипуляции
+    if cancelBeyondManip and (tDir < 0 ? close > tD1h : close < tD1l)
+        setupDead := true
+    // касание часовой зоны своего направления
+    bool dbgWin = dbgTrace and time >= dbgFrom and time <= dbgFrom + 48 * 3600 * 1000
+    // режим range: накапливаем диапазон дня, пока нет касания
+    if protMode == "range" and not touched and not setupDead
+        entryLvl := na(entryLvl) ? (tDir < 0 ? low : high) : (tDir < 0 ? math.min(entryLvl, low) : math.max(entryLvl, high))
+        rngBars += 1
+    if not touched and not setupDead and (not touchInSess or inSession) and array.size(hzones) > 0
+        float zt = na
+        float zb = na
+        int zk = 0
+        for i = 0 to array.size(hzones) - 1
+            Zone z = array.get(hzones, i)
+            if z.dir == tDir and bar_index > z.born and high >= z.bot and low <= z.top and (protMode != "range" or rngBars >= minRangeBars)
+                touched := true
+                zt := z.top
+                zb := z.bot
+                zk := z.kind
+                touchZBound := tDir < 0 ? z.top : z.bot
+        if touched
+            if protMode == "pause"
+                entryLvl := tDir < 0 ? low : high
+            paused := false
+            if dbgWin
+                label.new(bar_index, high, "T" + (zk == 1 ? "OB " : "FVG ") + str.tostring(zb, format.mintick) + "-" + str.tostring(zt, format.mintick), style = label.style_label_down, color = color.new(color.yellow, 20), textcolor = color.black, size = size.tiny)
+    else if touched and not setupDead
+        if protMode == "range"
+            // уровень заморожен при касании; пробой без живого ордера
+            if not orderLive and not limitArmed and (tDir < 0 ? low < entryLvl : high > entryLvl)
+                if nightMode == "dead"
+                    setupDead := true
+                else if nightMode == "rearm"
+                    touched := false
+                    entryLvl := na
+                else
+                    limitArmed := true
+        else
+            // pause: импульс продолжается (новый экстремум) → минимум сдвигается, паузы нет;
+            // бар без нового экстремума = проторговка (пауза) → можно ставить стоп-ордер
+            if tDir < 0 ? low < entryLvl : high > entryLvl
+                entryLvl := tDir < 0 ? low : high
+                paused := false
+            else
+                paused := true
+                if dbgWin and not paused[1]
+                    label.new(bar_index, high, "PAUSE " + str.tostring(entryLvl, format.mintick), style = label.style_label_down, color = color.new(color.olive, 20), textcolor = color.white, size = size.tiny)
+
+// детальный бар-лог в окне отладки (в таблицу)
+var string dbgLog = ""
+if dbgTrace and time >= dbgFrom and time <= dbgFrom + 48 * 3600 * 1000 and str.length(dbgLog) < 3800
+    dbgLog += str.format_time(time, "dd HH:mm", "UTC") + " l=" + str.tostring(low, format.mintick) + " c=" + str.tostring(close, format.mintick) + " d" + str.tostring(tDir) + " t" + (touched ? "1" : "0") + " p" + (paused ? "1" : "0") + " e" + str.tostring(entryLvl, format.mintick) + " s" + (inSession ? "1" : "0") + "\n"
+
+// фиксация факта сделки в этот день — ДО блока ордеров, чтобы не перевыставить ордер
+// на закрытии бара, внутри которого сделка успела открыться и закрыться
+var int lastClosedCnt = 0
+if strategy.closedtrades > lastClosedCnt
+    // классификация исхода: ближайший из уровней ТР / вход (БУ) / SL
+    float ep = strategy.closedtrades.exit_price(strategy.closedtrades - 1)
+    if not na(ep) and not na(entTP) and not na(entPx) and not na(entSL)
+        float dTP = math.abs(ep - entTP)
+        float dBE = math.abs(ep - entPx)
+        float dSL = math.abs(ep - entSL)
+        if dTP <= dBE and dTP <= dSL
+            cntTP += 1
+        else if dBE <= dSL
+            cntBE += 1
+        else
+            cntSL += 1
+    // выход вчерашней позиции при reentryBE не съедает сегодняшний сетап
+    if not (reentryBE and posFromPrevDay)
+        tradeDone := true
+    posFromPrevDay := false
+lastClosedCnt := strategy.closedtrades
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    tradeDone := true
+    entPx := strategy.position_avg_price
+    entSL := curSL
+    entTP := curTP
+
+// выставление/снятие ордеров (на закрытии каждого бара)
+if strategy.position_size == 0
+    bool entryOK = not entryInPrevRange or (tDir < 0 ? entryLvl <= tD1h : entryLvl >= tD1l)
+    if limitArmed and tDir != 0 and not setupDead and not tradeDone and not newsBlk and entryOK
+        // ночной пробой → лимитный вход на уровне пробитого края (ретест)
+        float slLvlL = stopMode == "h1zone" and not na(touchZBound) ? touchZBound : dayExt
+        float stopDistL = tDir < 0 ? slLvlL - entryLvl : entryLvl - slLvlL
+        if stopDistL > syminfo.mintick * 5
+            float qtyL = strategy.equity * riskPct / 100 / stopDistL
+            curSL := slLvlL
+            curTP := tDir < 0 ? entryLvl - rrMult * stopDistL : entryLvl + rrMult * stopDistL
+            beDone := false
+            if tDir < 0
+                strategy.entry("CRT S", strategy.short, qty = qtyL, limit = entryLvl, alert_message = "CRT SHORT (лимит) " + syminfo.ticker + " | вход " + str.tostring(entryLvl, format.mintick) + " | SL " + str.tostring(curSL, format.mintick) + " | TP " + str.tostring(curTP, format.mintick) + " | RR " + str.tostring(rrMult, "#.#"))
+                strategy.exit("X", "CRT S", stop = curSL, limit = curTP, alert_message = "CRT ВЫХОД short " + syminfo.ticker)
+            else
+                strategy.entry("CRT L", strategy.long, qty = qtyL, limit = entryLvl, alert_message = "CRT LONG (лимит) " + syminfo.ticker + " | вход " + str.tostring(entryLvl, format.mintick) + " | SL " + str.tostring(curSL, format.mintick) + " | TP " + str.tostring(curTP, format.mintick) + " | RR " + str.tostring(rrMult, "#.#"))
+                strategy.exit("X", "CRT L", stop = curSL, limit = curTP, alert_message = "CRT ВЫХОД long " + syminfo.ticker)
+    else if tDir != 0 and touched and (protMode == "range" or paused) and not setupDead and not tradeDone and not newsBlk and entryOK and nextInSess and (tDir < 0 ? close > entryLvl : close < entryLvl)
+        float slLvl = stopMode == "h1zone" and not na(touchZBound) ? touchZBound : dayExt
+        float stopDist = tDir < 0 ? slLvl - entryLvl : entryLvl - slLvl
+        if stopDist > syminfo.mintick * 5
+            float qty = strategy.equity * riskPct / 100 / stopDist
+            curSL := slLvl
+            curTP := tDir < 0 ? entryLvl - rrMult * stopDist : entryLvl + rrMult * stopDist
+            beDone := false
+            orderLive := true
+            if tDir < 0
+                strategy.entry("CRT S", strategy.short, qty = qty, stop = entryLvl, alert_message = "CRT SHORT " + syminfo.ticker + " | вход " + str.tostring(entryLvl, format.mintick) + " | SL " + str.tostring(curSL, format.mintick) + " | TP " + str.tostring(curTP, format.mintick) + " | RR " + str.tostring(rrMult, "#.#"))
+                strategy.exit("X", "CRT S", stop = curSL, limit = curTP, alert_message = "CRT ВЫХОД short " + syminfo.ticker)
+            else
+                strategy.entry("CRT L", strategy.long, qty = qty, stop = entryLvl, alert_message = "CRT LONG " + syminfo.ticker + " | вход " + str.tostring(entryLvl, format.mintick) + " | SL " + str.tostring(curSL, format.mintick) + " | TP " + str.tostring(curTP, format.mintick) + " | RR " + str.tostring(rrMult, "#.#"))
+                strategy.exit("X", "CRT L", stop = curSL, limit = curTP, alert_message = "CRT ВЫХОД long " + syminfo.ticker)
+        else
+            orderLive := false
+    else
+        orderLive := false
+        strategy.cancel_all()
+else
+    // позиция открыта: держим exit актуальным (после БУ stop = цена входа)
+    strategy.exit("X", stop = curSL, limit = curTP, alert_message = "CRT ВЫХОД " + syminfo.ticker + (beDone ? " (после БУ)" : ""))
+
+if strategy.position_size != 0
+    barsInPos += 1
+
+// ================= ВИЗУАЛИЗАЦИЯ И МАРКЕР =================
+bgcolor(tDir < 0 ? color.new(color.red, 90) : tDir > 0 ? color.new(color.green, 90) : na)
+plot(tDir != 0 and touched and not setupDead and strategy.position_size == 0 ? entryLvl : na, "Уровень входа", color = color.new(color.blue, 20), style = plot.style_linebr)
+
+// помесячные доходности (для сверки с боевыми потоками)
+bool showMonthly = input.bool(false, "Таблица помесячных доходностей", group = "Отладка")
+var string moLog = ""
+var float moStartEq = na
+if ta.change(month) != 0 or barstate.isfirst
+    if not na(moStartEq) and moStartEq > 0 and str.length(moLog) < 3800
+        float moRet = (strategy.equity - moStartEq) / moStartEq * 100
+        moLog += str.format_time(time - 86400000, "yyyy-MM", "UTC") + " " + (moRet >= 0 ? "+" : "") + str.tostring(moRet, "#.##") + "%\n"
+    moStartEq := strategy.equity
+
+var table tm = table.new(position.bottom_left, 1, 1)
+if (barstate.islastconfirmedhistory or barstate.islast) and showMonthly and moLog != ""
+    table.cell(tm, 0, 0, moLog, text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.tiny, text_halign = text.align_left)
+
+var table tl = table.new(position.middle_left, 1, 1)
+if (barstate.islastconfirmedhistory or barstate.islast) and dbgTrace and dbgLog != ""
+    table.cell(tl, 0, 0, dbgLog, text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.tiny, text_halign = text.align_left)
+
+var table t = table.new(position.top_right, 1, 2)
+if barstate.islastconfirmedhistory or barstate.islast
+    table.cell(t, 0, 0, "CRTS v2.0-" + protMode + "-" + nightMode + (newsMode > 0 ? "-N" + str.tostring(newsMode) : "") + (nightOff ? "-ДЕНЬ" : "") + (reentryBE ? "-RE" : "") + "-" + crtClose + "-" + stopMode + "-m" + str.tostring(minRangeBars) + " | poi S" + str.tostring(poiS) + " L" + str.tostring(poiL) + " | trades " + str.tostring(strategy.closedtrades) + (timeframe.period == "60" ? "" : " / TF=" + timeframe.period + " (нужен 60!)"), text_color = color.white, bgcolor = color.new(color.navy, 20))
+    table.cell(t, 0, 1, "ENT " + str.tostring(cntEnt) + " | BLK " + str.tostring(cntBlk) + " | DEAD " + str.tostring(cntDead) + " | TCH " + str.tostring(cntTch) + " | NOTCH " + str.tostring(cntNoTch) + " | TP " + str.tostring(cntTP) + " BE " + str.tostring(cntBE) + " SL " + str.tostring(cntSL), text_color = color.white, bgcolor = color.new(color.navy, 40))
