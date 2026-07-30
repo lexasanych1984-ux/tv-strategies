@@ -1,0 +1,455 @@
+//@version=6
+// MSNR v1.1 — Malaysian Support & Resistance.
+// Отличие от v1.0 — только Блок 6 (тейк/RR) плюс два новых фильтра.
+// Блоки 1-5 и 7 перенесены без изменений.
+//
+// Почему правился Блок 6 (батч 2026-07-30): TP = «ближайшая СВЕЖАЯ встречная зона»
+// при обязательном трендовом фильтре H4 недостижим by design — в аптренде ближние
+// сопротивления уже испачканы касаниями, выживают только далёкие (5-10R).
+// Итог v1.0: gross_profit = 0 у восьми инструментов из десяти.
+strategy("MSNR Trend Pullback v1.1", "MSNR v1.1", overlay = true, initial_capital = 10000, pyramiding = 0,
+     margin_long = 0, margin_short = 0,
+     commission_type = strategy.commission.percent, commission_value = 0.055, slippage = 2,
+     calc_on_every_tick = false, process_orders_on_close = true,
+     max_bars_back = 1000, max_labels_count = 500, max_boxes_count = 500, max_lines_count = 500)
+
+// ================= ИНПУТЫ =================
+string tfTrend  = input.timeframe("240", "ТФ тренда", group = "Блок 1 · Тренд")
+int    pivTrend = input.int(3, "Пивот тренда (слева = справа)", minval = 1, group = "Блок 1 · Тренд")
+bool   allowL   = input.bool(true, "Разрешить лонги", group = "Блок 1 · Тренд")
+bool   allowS   = input.bool(true, "Разрешить шорты", group = "Блок 1 · Тренд")
+
+string tfZone   = input.timeframe("60", "ТФ зон", group = "Блок 2 · Зоны POI")
+int    pivZone  = input.int(5, "Пивот зон (слева = справа)", minval = 1, group = "Блок 2 · Зоны POI")
+int    maxZones = input.int(3, "Макс. POI-зон в каждую сторону", minval = 1, group = "Блок 2 · Зоны POI")
+bool   bornFresh = input.bool(true, "POI рождается свежей только если правое плечо в неё не заходило", group = "Блок 2 · Зоны POI")
+// A4
+string poiKill  = input.string("touch", "Что убивает свежесть POI", options = ["touch", "soft"],
+     tooltip = "touch — любое касание (строгая трактовка v1.0). soft — только реальный вход или закрытие за дальней границей зоны.", group = "Блок 2 · Зоны POI")
+
+int    maxTgt   = input.int(6, "Макс. целевых зон в каждую сторону", minval = 1,
+     tooltip = "Целевой пул v1.1: свежесть НЕ требуется, отработанные зоны остаются целями.", group = "Блок 6 · Тейк")
+
+int    maxGapMin = input.int(0, "Убивать сетап при разрыве баров больше N минут (0 = выкл)", minval = 0, step = 15, group = "Блок 3-4 · Окно и триггер")
+int    entryWindow = input.int(5, "Окно входа от касания, баров", minval = 1, group = "Блок 3-4 · Окно и триггер")
+int    confirmBars = input.int(2, "Дедлайн подтверждения, баров", minval = 1, group = "Блок 3-4 · Окно и триггер")
+bool   confirmInsideWindow = input.bool(false, "Подтверждение обязано уложиться в окно входа", group = "Блок 3-4 · Окно и триггер")
+bool   useRejection = input.bool(true, "Триггер А: rejection", group = "Блок 3-4 · Окно и триггер")
+bool   useSweep     = input.bool(true, "Триггер Б: sweep + reclaim", group = "Блок 3-4 · Окно и триггер")
+// A2
+bool   sweepNeedsConfirm = input.bool(true, "Триггеру Б нужна свеча-подтверждения",
+     tooltip = "false — вход по закрытию самой sweep-свечи. Для триггера А подтверждение остаётся обязательным всегда.", group = "Блок 3-4 · Окно и триггер")
+float  wickRatio    = input.float(0.5, "А: мин. доля фитиля в свече", minval = 0.1, maxval = 0.9, step = 0.05, group = "Блок 3-4 · Окно и триггер")
+float  minRangeAtr  = input.float(0.8, "А: мин. размер свечи, ×ATR", minval = 0.0, step = 0.1, group = "Блок 3-4 · Окно и триггер")
+
+int    atrLen   = input.int(14, "ATR (рабочий ТФ)", minval = 1, group = "Блок 5 · Стоп")
+float  slBufAtr = input.float(0.3, "Буфер стопа за зоной, ×ATR", minval = 0.0, step = 0.1, group = "Блок 5 · Стоп")
+
+float  minRR      = input.float(2.0, "Мин. RR (после cap и fallback)", minval = 0.1, step = 0.1, group = "Блок 6 · Тейк")
+float  fallbackR  = input.float(2.5, "Fallback: нет встречной зоны → TP = N×R", minval = 0.1, step = 0.1, group = "Блок 6 · Тейк")
+float  capR       = input.float(3.0, "Cap: TP не дальше N×R", minval = 0.1, step = 0.1, group = "Блок 6 · Тейк")
+
+float  riskPct  = input.float(1.0, "Риск на сделку, % от эквити", minval = 0.1, step = 0.25, group = "Блок 7 · Риск")
+// A1
+string beMode   = input.string("half_tp", "Безубыток", options = ["off", "1R", "half_tp"],
+     tooltip = "half_tp — перенос на 50% пути от входа до TP.", group = "Блок 7 · Риск")
+bool   exitOnTrendFlip = input.bool(false, "Закрывать позицию при смене тренда H4", group = "Блок 7 · Риск")
+
+// Комиссионный фильтр. Pine не может прочитать commission_value из strategy(),
+// поэтому costPctSide держится синхронно с псевдо-инпутом in_29 ВРУЧНУЮ.
+// Значение печатается в маркере таблицы — рассинхрон виден в каждом снимке.
+float  costPctSide = input.float(0.055, "Издержки: комиссия % за сторону (синхронно с in_29!)", minval = 0.0, step = 0.001, group = "Блок 6 · Фильтр издержек")
+int    slipTicks   = input.int(2, "Издержки: проскальзывание, тиков за сторону", minval = 0, group = "Блок 6 · Фильтр издержек")
+float  kCost       = input.float(3.0, "Пропуск, если стоп меньше K × стоимости круга", minval = 0.0, step = 0.5, group = "Блок 6 · Фильтр издержек")
+
+bool   showZones = input.bool(false, "Рисовать зоны", group = "Отображение")
+bool   showMarks = input.bool(false, "Метки триггеров и отказов", group = "Отображение")
+
+// ================= СТАРШИЕ ТФ (без изменений) =================
+f_trend() =>
+    float ph = ta.pivothigh(pivTrend, pivTrend)
+    float pl = ta.pivotlow(pivTrend, pivTrend)
+    var float h0 = na
+    var float h1 = na
+    var float l0 = na
+    var float l1 = na
+    if not na(ph)
+        h1 := h0
+        h0 := ph
+    if not na(pl)
+        l1 := l0
+        l0 := pl
+    int tr = 0
+    if not na(h1) and not na(l1)
+        if h0 > h1 and l0 > l1
+            tr := 1
+        else if h0 < h1 and l0 < l1
+            tr := -1
+    tr
+
+f_zones() =>
+    float ph = ta.pivothigh(pivZone, pivZone)
+    float pl = ta.pivotlow(pivZone, pivZone)
+    float sLo = na(pl) ? na : low[pivZone]
+    float sHi = na(pl) ? na : math.min(open[pivZone], close[pivZone])
+    float rLo = na(ph) ? na : math.max(open[pivZone], close[pivZone])
+    float rHi = na(ph) ? na : high[pivZone]
+    float rightLo = ta.lowest(low, pivZone)
+    float rightHi = ta.highest(high, pivZone)
+    bool sStale = na(pl) ? false : rightLo <= sHi
+    bool rStale = na(ph) ? false : rightHi >= rLo
+    [sLo[1], sHi[1], rLo[1], rHi[1], sStale[1], rStale[1], time[1]]
+
+int htfTrend = request.security(syminfo.tickerid, tfTrend, f_trend()[1], lookahead = barmerge.lookahead_off)
+[zSupLo, zSupHi, zResLo, zResHi, supStale, resStale, zTime] = request.security(syminfo.tickerid, tfZone, f_zones(), lookahead = barmerge.lookahead_off)
+
+// ================= ЗОНЫ =================
+type Zone
+    float lo
+    float hi
+    int   born
+    box   bx
+
+// POI-пул: свежесть обязательна, зона выбывает по правилу poiKill.
+var array<Zone> supPOI = array.new<Zone>()
+var array<Zone> resPOI = array.new<Zone>()
+// Целевой пул v1.1: свежесть НЕ требуется, отработанные зоны остаются целями.
+var array<Zone> supTGT = array.new<Zone>()
+var array<Zone> resTGT = array.new<Zone>()
+
+f_kill(array<Zone> arr, int i) =>
+    Zone z = array.get(arr, i)
+    if not na(z.bx)
+        box.delete(z.bx)
+    array.remove(arr, i)
+
+f_prune(array<Zone> arr, int cap) =>
+    while array.size(arr) > cap
+        int worst = 0
+        float wd = -1.0
+        for i = 0 to array.size(arr) - 1
+            Zone z = array.get(arr, i)
+            float d = math.abs(close - (z.lo + z.hi) / 2)
+            if d > wd
+                wd := d
+                worst := i
+        f_kill(arr, worst)
+
+bool newZoneBar = not na(zTime) and (na(zTime[1]) or zTime != zTime[1])
+
+if newZoneBar
+    if not na(zSupLo)
+        if not (bornFresh and supStale)
+            box b = na
+            if showZones
+                b := box.new(bar_index, zSupHi, bar_index + 1, zSupLo, border_color = color.new(color.teal, 40), bgcolor = color.new(color.teal, 88), extend = extend.right)
+            array.push(supPOI, Zone.new(zSupLo, zSupHi, bar_index, b))
+        array.push(supTGT, Zone.new(zSupLo, zSupHi, bar_index, na))
+    if not na(zResLo)
+        if not (bornFresh and resStale)
+            box b2 = na
+            if showZones
+                b2 := box.new(bar_index, zResHi, bar_index + 1, zResLo, border_color = color.new(color.maroon, 40), bgcolor = color.new(color.maroon, 88), extend = extend.right)
+            array.push(resPOI, Zone.new(zResLo, zResHi, bar_index, b2))
+        array.push(resTGT, Zone.new(zResLo, zResHi, bar_index, na))
+    f_prune(supPOI, maxZones)
+    f_prune(resPOI, maxZones)
+    f_prune(supTGT, maxTgt)
+    f_prune(resTGT, maxTgt)
+
+// ---- Блок 6: цель. Свежесть цели не требуется, применяются fallback и cap.
+// Возврат: [tp, usedFallback, usedCap]
+f_targetLong(float px, float riskPx) =>
+    float zt = na
+    if array.size(resTGT) > 0
+        for i = 0 to array.size(resTGT) - 1
+            Zone z = array.get(resTGT, i)
+            if z.lo > px and (na(zt) or z.lo < zt)
+                zt := z.lo
+    float capT = px + capR * riskPx
+    bool fb = na(zt)
+    bool cp = not fb and zt > capT
+    float tp = fb ? px + fallbackR * riskPx : math.min(zt, capT)
+    [tp, fb, cp]
+
+f_targetShort(float px, float riskPx) =>
+    float zt = na
+    if array.size(supTGT) > 0
+        for i = 0 to array.size(supTGT) - 1
+            Zone z = array.get(supTGT, i)
+            if z.hi < px and (na(zt) or z.hi > zt)
+                zt := z.hi
+    float capT = px - capR * riskPx
+    bool fb = na(zt)
+    bool cp = not fb and zt < capT
+    float tp = fb ? px - fallbackR * riskPx : math.max(zt, capT)
+    [tp, fb, cp]
+
+f_median(array<float> a) =>
+    float m = na
+    if array.size(a) > 0
+        array<float> c = array.copy(a)
+        array.sort(c, order.ascending)
+        int n = array.size(c)
+        int h = int(n / 2)
+        m := n % 2 == 1 ? array.get(c, h) : (array.get(c, h - 1) + array.get(c, h)) / 2
+    m
+
+// ================= СОСТОЯНИЕ =================
+var int   winDir  = 0
+var int   winLeft = 0
+var float winLo   = na
+var float winHi   = na
+
+var int   trigDir  = 0
+var int   trigLeft = 0
+var float trigHi   = na
+var float trigLo   = na
+var float trigZLo  = na
+var float trigZHi  = na
+
+var float curSL = na
+var float curTP = na
+var float entR  = na
+var float entPx = na
+var bool  beDone = false
+
+var array<float> rMults = array.new_float()
+var array<float> durs   = array.new_float()
+var array<float> pendR  = array.new_float()
+var int lastClosed = 0
+
+var int cntWin    = 0
+var int cntTrig   = 0
+var int cntNoConf = 0
+var int cntRR     = 0
+var int cntCost   = 0
+var int cntBusy   = 0
+var int cntGap    = 0
+var int cntEnt    = 0
+var int cntFB     = 0
+var int cntCap    = 0
+var int cntEval   = 0   // сетапов, дошедших до оценки TP/RR
+
+float atrv = ta.atr(atrLen)
+
+if maxGapMin > 0 and bar_index > 0 and time - time[1] > maxGapMin * 60000
+    if winDir != 0 or trigDir != 0
+        cntGap += 1
+    winDir  := 0
+    winLeft := 0
+    trigDir := 0
+
+// ---- учёт закрытых сделок: R-кратность и длительность
+if strategy.closedtrades > lastClosed
+    for k = lastClosed to strategy.closedtrades - 1
+        if array.size(pendR) > 0
+            float r0 = array.shift(pendR)
+            if not na(r0) and r0 > 0
+                array.push(rMults, strategy.closedtrades.profit(k) / r0)
+                array.push(durs, float(strategy.closedtrades.exit_bar_index(k) - strategy.closedtrades.entry_bar_index(k)))
+    lastClosed := strategy.closedtrades
+
+// ---- позиция: БУ, выход, опциональный выход по смене тренда
+if strategy.position_size != 0
+    if beMode != "off" and not beDone and not na(entR) and not na(entPx)
+        float trigLvl = beMode == "1R" ? entR : math.abs(curTP - entPx) / 2
+        if strategy.position_size > 0 and high >= entPx + trigLvl
+            curSL := entPx
+            beDone := true
+        if strategy.position_size < 0 and low <= entPx - trigLvl
+            curSL := entPx
+            beDone := true
+    if exitOnTrendFlip and ((strategy.position_size > 0 and htfTrend != 1) or (strategy.position_size < 0 and htfTrend != -1))
+        strategy.close_all(comment = "тренд H4 сломан")
+    else
+        strategy.exit("X", stop = curSL, limit = curTP)
+
+// ---- fireDir: сигнал, готовый к оценке входа на этом баре
+int   fireDir = 0
+float fireHi  = na
+float fireLo  = na
+float fireZLo = na
+float fireZHi = na
+
+// ---- Блок 4: подтверждение триггера с предыдущих баров
+if trigDir != 0
+    bool windowGone = confirmInsideWindow and winLeft <= 0
+    bool conf = trigDir == 1 ? close > trigHi : close < trigLo
+    if conf and not windowGone
+        fireDir := trigDir
+        fireHi  := trigHi
+        fireLo  := trigLo
+        fireZLo := trigZLo
+        fireZHi := trigZHi
+        trigDir := 0
+    else
+        trigLeft -= 1
+        if trigLeft <= 0 or windowGone
+            trigDir := 0
+            cntNoConf += 1
+
+// ---- Блок 2-3: касание зоны, окно входа
+float tchLo = na
+float tchHi = na
+if array.size(supPOI) > 0
+    for i = array.size(supPOI) - 1 to 0
+        Zone z = array.get(supPOI, i)
+        // окно открывает только НОВЫЙ заход в зону (в soft-режиме цена может стоять в зоне долго)
+        bool entered = low <= z.hi and (na(low[1]) or low[1] > z.hi)
+        if bar_index > z.born and entered
+            if na(tchLo) or z.lo < tchLo
+                tchLo := z.lo
+                tchHi := z.hi
+        if bar_index > z.born and poiKill == "touch" and low <= z.hi
+            f_kill(supPOI, i)
+        else if bar_index > z.born and poiKill == "soft" and close < z.lo
+            f_kill(supPOI, i)
+
+float tchResLo = na
+float tchResHi = na
+if array.size(resPOI) > 0
+    for i = array.size(resPOI) - 1 to 0
+        Zone z = array.get(resPOI, i)
+        bool entered = high >= z.lo and (na(high[1]) or high[1] < z.lo)
+        if bar_index > z.born and entered
+            if na(tchResHi) or z.hi > tchResHi
+                tchResLo := z.lo
+                tchResHi := z.hi
+        if bar_index > z.born and poiKill == "touch" and high >= z.lo
+            f_kill(resPOI, i)
+        else if bar_index > z.born and poiKill == "soft" and close > z.hi
+            f_kill(resPOI, i)
+
+if not na(tchLo) and htfTrend == 1 and allowL
+    winDir  := 1
+    winLo   := tchLo
+    winHi   := tchHi
+    winLeft := entryWindow
+    trigDir := 0
+    cntWin  += 1
+else if not na(tchResHi) and htfTrend == -1 and allowS
+    winDir  := -1
+    winLo   := tchResLo
+    winHi   := tchResHi
+    winLeft := entryWindow
+    trigDir := 0
+    cntWin  += 1
+
+// ---- Блок 4: поиск триггерной свечи внутри окна
+if winDir != 0 and winLeft > 0 and trigDir == 0 and fireDir == 0
+    float rng = high - low
+    bool bigEnough = rng >= minRangeAtr * atrv
+    bool rej = false
+    bool swp = false
+    if winDir == 1
+        float wick = math.min(open, close) - low
+        rej := useRejection and rng > 0 and wick >= wickRatio * rng and close > open and low <= winHi and low >= winLo and bigEnough
+        swp := useSweep and low < winLo and close >= winLo
+    else
+        float wick = high - math.max(open, close)
+        rej := useRejection and rng > 0 and wick >= wickRatio * rng and close < open and high >= winLo and high <= winHi and bigEnough
+        swp := useSweep and high > winHi and close <= winHi
+    if rej or swp
+        cntTrig += 1
+        if showMarks
+            label.new(bar_index, winDir == 1 ? low : high, "T", style = winDir == 1 ? label.style_triangleup : label.style_triangledown, color = color.new(color.yellow, 20), size = size.tiny)
+        // A2: sweep может входить сразу, rejection — всегда через подтверждение
+        if swp and not sweepNeedsConfirm
+            fireDir := winDir
+            fireHi  := high
+            fireLo  := low
+            fireZLo := winLo
+            fireZHi := winHi
+        else
+            trigDir  := winDir
+            trigLeft := confirmBars
+            trigHi   := high
+            trigLo   := low
+            trigZLo  := winLo
+            trigZHi  := winHi
+
+if winLeft > 0
+    winLeft -= 1
+    if winLeft == 0
+        winDir := 0
+
+// ---- Блоки 5-7: стоп, цель, фильтры, вход
+if fireDir != 0
+    if strategy.position_size != 0
+        cntBusy += 1
+    else
+        cntEval += 1
+        float entryPx = close
+        float slPx = fireDir == 1 ? math.min(fireZLo, fireLo) - slBufAtr * atrv : math.max(fireZHi, fireHi) + slBufAtr * atrv
+        float risk = fireDir == 1 ? entryPx - slPx : slPx - entryPx
+        float rtCost = 2 * (costPctSide / 100) * entryPx + 2 * slipTicks * syminfo.mintick
+        [tpL, fbL, cpL] = f_targetLong(entryPx, risk)
+        [tpS, fbS, cpS] = f_targetShort(entryPx, risk)
+        float tpPx = fireDir == 1 ? tpL : tpS
+        bool  usedFB = fireDir == 1 ? fbL : fbS
+        bool  usedCap = fireDir == 1 ? cpL : cpS
+        float rr = risk <= 0 ? na : (fireDir == 1 ? tpPx - entryPx : entryPx - tpPx) / risk
+        if risk <= syminfo.mintick * 5 or na(rr)
+            cntRR += 1
+        else if risk < kCost * rtCost
+            // порядок важен: ветки if/else должны быть однотипными (void),
+            // а `if showMarks / label.new(...)` возвращает label — держим его НЕ последним
+            if showMarks
+                label.new(bar_index, fireDir == 1 ? low : high, "издержки", style = fireDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 40), textcolor = color.white, size = size.tiny)
+            cntCost += 1
+        else if rr < minRR
+            if showMarks
+                label.new(bar_index, fireDir == 1 ? low : high, "RR " + str.tostring(rr, "#.##"), style = fireDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.orange, 50), textcolor = color.white, size = size.tiny)
+            cntRR += 1
+        else
+            float qty = strategy.equity * riskPct / 100 / risk
+            curSL := slPx
+            curTP := tpPx
+            entR  := risk
+            entPx := entryPx
+            beDone := false
+            cntEnt += 1
+            if usedFB
+                cntFB += 1
+            if usedCap
+                cntCap += 1
+            array.push(pendR, strategy.equity * riskPct / 100)
+            if fireDir == 1
+                strategy.entry("MSNR L", strategy.long, qty = qty)
+            else
+                strategy.entry("MSNR S", strategy.short, qty = qty)
+            strategy.exit("X", stop = slPx, limit = tpPx)
+
+// ================= ОТОБРАЖЕНИЕ =================
+bgcolor(htfTrend == 1 ? color.new(color.teal, 94) : htfTrend == -1 ? color.new(color.maroon, 94) : na)
+
+string cfg = "MSNR v1.1 " + syminfo.ticker + " " + tfTrend + "/" + tfZone + "/" + timeframe.period +
+     " be=" + beMode + " swpConf=" + (sweepNeedsConfirm ? "1" : "0") + " w" + str.tostring(entryWindow) +
+     " poi=" + poiKill + " fb" + str.tostring(fallbackR, "#.#") + "R cap" + str.tostring(capR, "#.#") + "R" +
+     " RR" + str.tostring(minRR, "#.#") + " k" + str.tostring(kCost, "#.#") + " ком" + str.tostring(costPctSide, "#.###") + "%"
+
+float medR = f_median(rMults)
+float medD = f_median(durs)
+float maxWinR = 0.0
+float maxLosR = 0.0
+if array.size(rMults) > 0
+    maxWinR := array.max(rMults)
+    maxLosR := array.min(rMults)
+
+var table t = table.new(position.top_right, 1, 4)
+if barstate.islastconfirmedhistory or barstate.islast
+    table.cell(t, 0, 0, cfg, text_color = color.white, bgcolor = color.new(color.navy, 20), text_size = size.small)
+    table.cell(t, 0, 1, "воронка: окон " + str.tostring(cntWin) + " → триггеров " + str.tostring(cntTrig) +
+         " → без подтв. " + str.tostring(cntNoConf) + " → оценок " + str.tostring(cntEval) +
+         " | RR<" + str.tostring(minRR, "#.#") + " " + str.tostring(cntRR) + " | издержки " + str.tostring(cntCost) +
+         " | занято " + str.tostring(cntBusy) + " → входов " + str.tostring(cntEnt),
+         text_color = color.white, bgcolor = color.new(color.navy, 40), text_size = size.small)
+    table.cell(t, 0, 2, "TP: fallback " + str.tostring(cntFB) + " | cap " + str.tostring(cntCap) +
+         " | зона " + str.tostring(cntEnt - cntFB - cntCap),
+         text_color = color.white, bgcolor = color.new(color.navy, 55), text_size = size.small)
+    table.cell(t, 0, 3, "закрыто " + str.tostring(strategy.closedtrades) +
+         " | R: макс+" + str.tostring(maxWinR, "#.##") + " макс−" + str.tostring(maxLosR, "#.##") +
+         " медиана " + str.tostring(medR, "#.##") +
+         " | длит. медиана " + str.tostring(medD, "#") + " баров",
+         text_color = color.white, bgcolor = color.new(color.navy, 70), text_size = size.small)
