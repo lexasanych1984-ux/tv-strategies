@@ -14,8 +14,13 @@
 | Докачка истории | там же, `backfill-history.cjs` (свежий график отдаёт 300 баров!) |
 | Чтение таблиц Pine | там же, `read-pine-tables.cjs` |
 
-⚠️ Скрипты-прогонщики **не в git** (лежат в репо `tradingview-mcp`, чей origin — чужой
-upstream `tradesdontlie/tradingview-mcp`). При переустановке MCP их надо будет восстановить.
+**Прогонщики продублированы в `tv-strategies/tools/`** — это канонический источник в git
+(`backfill-history.cjs`, `msnr-ab-runner.cjs`, `read-pine-tables.cjs`, `strategy-symbol-stats.cjs`).
+Запускать их надо из рабочей копии в `tradingview-mcp\scripts\`: они тянут
+`chrome-remote-interface` из `node_modules` репозитория MCP по относительному пути.
+Дубль нужен потому, что репо `tradingview-mcp` — чужой upstream
+(`tradesdontlie/tradingview-mcp`), скрипты туда не коммитятся и при переустановке MCP теряются.
+⚠️ При правке рабочей копии обновлять и канонический источник, иначе разъедутся.
 
 Не трогать (боевые): `CRT Day 1H Strategy v1` v25, `Frol_OF_euro-funt_SMC_4H-15m_D-1H` v24,
 `Frol_OF_ger-nas_sweep_M5` v22. Предыдущие версии MSNR (v1, v1.1, Funnel Diag) сохранены
