@@ -1,0 +1,484 @@
+//@version=6
+// MSNR-вход + R-менеджмент, v1.3.
+//
+// Отличие от v1.2: добавлен СЕССИОННЫЙ ФИЛЬТР (шаг 3.6). Торговая логика v1.2
+// не изменена ни в одном месте — фильтр только гейтит бар входа.
+//
+// Основание (docs/msnr-stage3-3.5-sweepConfirm-2026-07-31.md,
+// docs/msnr-class-breakdown-2026-07-31.md): все три ослабления воронки Этапа 3
+// откачены, край системы отрицателен на самой базе (−0.109% на сделку).
+// Наращивание потока умножает убыток, поэтому работа переведена на качество входа.
+// Гипотеза: свипы зон вне ликвидных сессий — шум; фильтр должен поднять WR.
+// Дефицит до безубытка при tpR 2.5 — около 5 п.п. (23.2% против ≈28%).
+//
+// ВАЖНО ПРО in_N. Два новых инпута объявлены ПОСЛЕДНИМИ среди всех input.* и
+// получают in_30 / in_31. Пользовательские in_0…in_29 НЕ сдвигаются — оверрайды
+// Этапа 3 остаются валидными. Но блок свойств стратегии съезжает на два:
+// commission_value in_35 → in_37, slippage in_36 → in_38.
+// Прогонщик запускать с COMM_ID=in_37. costPctSide — это in_23, он не двигается.
+// Проверка: комиссия печатается в маркере таблицы.
+//
+// Дефолты сессий ПУСТЫЕ = фильтр выключен. При обоих пустых v1.3 обязана
+// воспроизводить базу v1.2 цифра в цифру — это встроенная миграционная проверка.
+strategy("MSNR Entry + R-mgmt v1.3", "MSNR v1.3", overlay = true, initial_capital = 10000, pyramiding = 0,
+     margin_long = 0, margin_short = 0,
+     commission_type = strategy.commission.percent, commission_value = 0.055, slippage = 2,
+     calc_on_every_tick = false, process_orders_on_close = true,
+     max_bars_back = 1000, max_labels_count = 500, max_boxes_count = 500, max_lines_count = 500)
+
+// ================= БЛОК 1 · ТРЕНД H4 =================
+string tfTrend  = input.timeframe("240", "ТФ тренда", group = "Блок 1 · Тренд")
+int    pivTrend = input.int(3, "Пивот тренда (слева = справа)", minval = 1, group = "Блок 1 · Тренд")
+// Этап 3.3
+string trendMode = input.string("strict", "Режим тренда", options = ["strict", "lastSwing", "rangeEdges"],
+     tooltip = "strict — HH+HL / LH+LL, иначе не торгуем (v1.1). lastSwing — по последнему свингу. rangeEdges — strict, а в неопределённости лонг от низа диапазона, шорт от верха.",
+     group = "Блок 1 · Тренд")
+bool   allowL   = input.bool(true, "Разрешить лонги", group = "Блок 1 · Тренд")
+bool   allowS   = input.bool(true, "Разрешить шорты", group = "Блок 1 · Тренд")
+
+// ================= БЛОК 2 · ЗОНЫ POI =================
+string tfZone   = input.timeframe("60", "ТФ зон", group = "Блок 2 · Зоны POI")
+// Этап 3.2
+int    zonePivot = input.int(5, "Пивот зон (слева = справа)", minval = 1, group = "Блок 2 · Зоны POI")
+int    maxZones = input.int(3, "Макс. POI-зон в каждую сторону", minval = 1, group = "Блок 2 · Зоны POI")
+// Этап 3.0 (прогнано 31.07, откачено: Σ Net −46.18%, оба металла сломаны)
+bool   bornFresh = input.bool(true, "POI рождается свежей только если правое плечо в неё не заходило", group = "Блок 2 · Зоны POI")
+// Этап 3.1
+string freshMode = input.string("strict", "Что убивает свежесть POI", options = ["strict", "soft"],
+     tooltip = "strict — любое касание (v1.1). soft — только реальный вход из зоны или закрытие за её дальней границей.",
+     group = "Блок 2 · Зоны POI")
+
+// ================= БЛОКИ 3-4 · ОКНО И ТРИГГЕР =================
+int    maxGapMin = input.int(0, "Убивать сетап при разрыве баров больше N минут (0 = выкл)", minval = 0, step = 15, group = "Блок 3-4 · Окно и триггер")
+// Этап 3.4
+int    entryWindow = input.int(5, "Окно входа от касания, баров", minval = 1, group = "Блок 3-4 · Окно и триггер")
+int    confirmBars = input.int(2, "Дедлайн подтверждения, баров", minval = 1, group = "Блок 3-4 · Окно и триггер")
+bool   confirmInsideWindow = input.bool(false, "Подтверждение обязано уложиться в окно входа", group = "Блок 3-4 · Окно и триггер")
+bool   useRejection = input.bool(true, "Триггер А: rejection", group = "Блок 3-4 · Окно и триггер")
+bool   useSweep     = input.bool(true, "Триггер Б: sweep + reclaim", group = "Блок 3-4 · Окно и триггер")
+// Этап 3.5 (прогнано 31.07, откачено: WR −4.4 п.п. → подтверждение НЕСЁТ информацию,
+// остаётся в базе навсегда; кандидат на усиление, а не на снятие)
+bool   sweepConfirm = input.bool(true, "Триггеру Б нужна свеча-подтверждения", group = "Блок 3-4 · Окно и триггер")
+float  wickRatio    = input.float(0.5, "А: мин. доля фитиля в свече", minval = 0.1, maxval = 0.9, step = 0.05, group = "Блок 3-4 · Окно и триггер")
+float  minRangeAtr  = input.float(0.8, "А: мин. размер свечи, ×ATR", minval = 0.0, step = 0.1, group = "Блок 3-4 · Окно и триггер")
+
+// ================= БЛОК 5 · СТОП =================
+int    atrLen   = input.int(14, "ATR (рабочий ТФ)", minval = 1, group = "Блок 5 · Стоп")
+float  slBufAtr = input.float(0.3, "Буфер стопа за зоной, ×ATR", minval = 0.0, step = 0.1, group = "Блок 5 · Стоп")
+
+// ================= БЛОК 6 · ЦЕЛЬ И ФИЛЬТРЫ ВХОДА =================
+float  tpR      = input.float(2.5, "TP = N × риск", minval = 0.1, step = 0.1, group = "Блок 6 · Цель")
+float  minStopAtr = input.float(0.5, "Мин. стоп, ×ATR", minval = 0.0, step = 0.1, group = "Блок 6 · Цель")
+// Pine не читает commission_value из strategy(): costPctSide держится синхронно
+// с псевдо-инпутом commission_value ВРУЧНУЮ. Печатается в маркере таблицы.
+float  costPctSide = input.float(0.055, "Издержки: комиссия % за сторону (синхронно с commission_value!)", minval = 0.0, step = 0.001, group = "Блок 6 · Цель")
+int    slipTicks   = input.int(2, "Издержки: проскальзывание, тиков за сторону", minval = 0, group = "Блок 6 · Цель")
+float  kCost       = input.float(3.0, "Пропуск, если стоп меньше K × стоимости круга", minval = 0.0, step = 0.5, group = "Блок 6 · Цель")
+
+// ================= БЛОК 7 · РИСК =================
+float  riskPct  = input.float(1.0, "Риск на сделку, % от эквити", minval = 0.1, step = 0.25, group = "Блок 7 · Риск")
+string beMode   = input.string("half_tp", "Безубыток", options = ["off", "1R", "half_tp"], group = "Блок 7 · Риск")
+bool   exitOnTrendFlip = input.bool(false, "Закрывать позицию при смене тренда H4", group = "Блок 7 · Риск")
+
+bool   showMarks = input.bool(false, "Метки отказов", group = "Отображение")
+
+// ================= БЛОК 8 · СЕССИЯ (шаг 3.6) =================
+// ⚠️ ЭТИ ДВА ИНПУТА ОБЯЗАНЫ БЫТЬ ПОСЛЕДНИМИ СРЕДИ ВСЕХ input.* В ФАЙЛЕ.
+// Они получают in_30 / in_31. Любой input.*, добавленный ниже, сломает нумерацию.
+//
+// Пусто = окно выключено. Оба пусты = фильтр выключен целиком (поведение v1.2).
+// Два отдельных окна со своими часовыми поясами, а не одно перечисление, потому что
+// Лондон и Нью-Йорк переводят часы в разные даты: в едином референсном поясе одно из
+// окон уезжает на час примерно на 5 недель в году.
+// День недели задавать явно (":1234567"), иначе поведение зависит от умолчания Pine.
+string lonSess = input.string("", "Окно Лондона (Europe/London), пусто = выкл",
+     tooltip = "Формат «HHMM-HHMM:дни», напр. 0700-2100:1234567 (не-Азия, шаг 3.6a) или 0700-1000:1234567 (killzone, 3.6b).",
+     group = "Блок 8 · Сессия")
+string nySess  = input.string("", "Окно Нью-Йорка (America/New_York), пусто = выкл",
+     tooltip = "Формат «HHMM-HHMM:дни», напр. 0700-1000:1234567 (killzone NY, шаг 3.6b).",
+     group = "Блок 8 · Сессия")
+
+// Заглушка для выключенного окна: time() требует валидный спек сессии, поэтому при
+// пустом инпуте подставляем заведомо корректную строку, результат которой отбрасывается
+// флагом lonOn / nyOn. Сам спек при этом никакого смысла не несёт.
+string SESS_DUMMY = "0900-1000:1234567"
+
+bool lonOn = str.length(lonSess) > 0
+bool nyOn  = str.length(nySess)  > 0
+string lonSpec = lonOn ? lonSess : SESS_DUMMY
+string nySpec  = nyOn  ? nySess  : SESS_DUMMY
+
+bool inLon = lonOn and not na(time(timeframe.period, lonSpec, "Europe/London"))
+bool inNY  = nyOn  and not na(time(timeframe.period, nySpec,  "America/New_York"))
+bool sessOff = not lonOn and not nyOn
+// Фильтр выключен → пропускаем всё, ровно как v1.2.
+bool sessionOk = sessOff or inLon or inNY
+
+// ================= СТАРШИЕ ТФ =================
+f_trend() =>
+    float ph = ta.pivothigh(pivTrend, pivTrend)
+    float pl = ta.pivotlow(pivTrend, pivTrend)
+    var float h0 = na
+    var float h1 = na
+    var float l0 = na
+    var float l1 = na
+    var int lastSig = 0
+    if not na(ph)
+        h1 := h0
+        h0 := ph
+        if not na(h1)
+            lastSig := h0 > h1 ? 1 : h0 < h1 ? -1 : lastSig
+    if not na(pl)
+        l1 := l0
+        l0 := pl
+        if not na(l1)
+            lastSig := l0 < l1 ? -1 : l0 > l1 ? 1 : lastSig
+    int tr = 0
+    if not na(h1) and not na(l1)
+        if h0 > h1 and l0 > l1
+            tr := 1
+        else if h0 < h1 and l0 < l1
+            tr := -1
+    [tr[1], lastSig[1], h0[1], l0[1]]
+
+f_zones() =>
+    float ph = ta.pivothigh(zonePivot, zonePivot)
+    float pl = ta.pivotlow(zonePivot, zonePivot)
+    float sLo = na(pl) ? na : low[zonePivot]
+    float sHi = na(pl) ? na : math.min(open[zonePivot], close[zonePivot])
+    float rLo = na(ph) ? na : math.max(open[zonePivot], close[zonePivot])
+    float rHi = na(ph) ? na : high[zonePivot]
+    float rightLo = ta.lowest(low, zonePivot)
+    float rightHi = ta.highest(high, zonePivot)
+    bool sStale = na(pl) ? false : rightLo <= sHi
+    bool rStale = na(ph) ? false : rightHi >= rLo
+    [sLo[1], sHi[1], rLo[1], rHi[1], sStale[1], rStale[1], time[1]]
+
+[htfStrict, htfLast, swHi, swLo] = request.security(syminfo.tickerid, tfTrend, f_trend(), lookahead = barmerge.lookahead_off)
+[zSupLo, zSupHi, zResLo, zResHi, supStale, resStale, zTime] = request.security(syminfo.tickerid, tfZone, f_zones(), lookahead = barmerge.lookahead_off)
+
+int htfTrend = 0
+if trendMode == "strict"
+    htfTrend := htfStrict
+else if trendMode == "lastSwing"
+    htfTrend := htfLast
+else
+    if htfStrict != 0
+        htfTrend := htfStrict
+    else if not na(swHi) and not na(swLo) and swHi > swLo
+        float mid = (swHi + swLo) / 2
+        htfTrend := close < mid ? 1 : close > mid ? -1 : 0
+
+// ================= ЗОНЫ (только для входа) =================
+type Zone
+    float lo
+    float hi
+    int   born
+
+var array<Zone> supPOI = array.new<Zone>()
+var array<Zone> resPOI = array.new<Zone>()
+
+f_prune(array<Zone> arr, int cap) =>
+    while array.size(arr) > cap
+        int worst = 0
+        float wd = -1.0
+        for i = 0 to array.size(arr) - 1
+            Zone z = array.get(arr, i)
+            float d = math.abs(close - (z.lo + z.hi) / 2)
+            if d > wd
+                wd := d
+                worst := i
+        array.remove(arr, worst)
+
+// удаление зоны по границам (freshMode = soft: зона умирает от РЕАЛЬНОГО входа)
+f_killByBounds(array<Zone> arr, float lo, float hi) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            Zone z = array.get(arr, i)
+            if z.lo == lo and z.hi == hi
+                array.remove(arr, i)
+
+f_median(array<float> a) =>
+    float m = na
+    if array.size(a) > 0
+        array<float> c = array.copy(a)
+        array.sort(c, order.ascending)
+        int n = array.size(c)
+        int h = int(n / 2)
+        m := n % 2 == 1 ? array.get(c, h) : (array.get(c, h - 1) + array.get(c, h)) / 2
+    m
+
+bool newZoneBar = not na(zTime) and (na(zTime[1]) or zTime != zTime[1])
+
+if newZoneBar
+    if not na(zSupLo) and not (bornFresh and supStale)
+        array.push(supPOI, Zone.new(zSupLo, zSupHi, bar_index))
+    if not na(zResLo) and not (bornFresh and resStale)
+        array.push(resPOI, Zone.new(zResLo, zResHi, bar_index))
+    f_prune(supPOI, maxZones)
+    f_prune(resPOI, maxZones)
+
+// ================= СОСТОЯНИЕ =================
+var int   winDir  = 0
+var int   winLeft = 0
+var float winLo   = na
+var float winHi   = na
+
+var int   trigDir  = 0
+var int   trigLeft = 0
+var float trigHi   = na
+var float trigLo   = na
+var float trigZLo  = na
+var float trigZHi  = na
+
+var float curSL = na
+var float curTP = na
+var float entR  = na
+var float entPx = na
+var bool  beDone = false
+
+var array<float> rMults = array.new_float()
+var array<float> durs   = array.new_float()
+var array<float> pendR  = array.new_float()
+var int lastClosed = 0
+
+var int cntWin     = 0
+var int cntTrig    = 0
+var int cntNoConf  = 0
+var int cntEval    = 0
+var int cntCost    = 0
+var int cntMinStop = 0
+var int cntBusy    = 0
+var int cntGap     = 0
+var int cntEnt     = 0
+var int cntSess    = 0
+
+float atrv = ta.atr(atrLen)
+
+if maxGapMin > 0 and bar_index > 0 and time - time[1] > maxGapMin * 60000
+    if winDir != 0 or trigDir != 0
+        cntGap += 1
+    winDir  := 0
+    winLeft := 0
+    trigDir := 0
+
+// ---- учёт закрытых сделок: R-кратность и длительность
+if strategy.closedtrades > lastClosed
+    for k = lastClosed to strategy.closedtrades - 1
+        if array.size(pendR) > 0
+            float r0 = array.shift(pendR)
+            if not na(r0) and r0 > 0
+                array.push(rMults, strategy.closedtrades.profit(k) / r0)
+                array.push(durs, float(strategy.closedtrades.exit_bar_index(k) - strategy.closedtrades.entry_bar_index(k)))
+    lastClosed := strategy.closedtrades
+
+// ---- позиция: БУ, выход
+// ⚠️ СЕССИЯ ЗДЕСЬ НЕ УЧАСТВУЕТ. Позиция, открытая в сессии, живёт до TP/SL —
+// закрытия по времени нет ни при каких настройках фильтра.
+if strategy.position_size != 0
+    if beMode != "off" and not beDone and not na(entR) and not na(entPx)
+        float trigLvl = beMode == "1R" ? entR : math.abs(curTP - entPx) / 2
+        if strategy.position_size > 0 and high >= entPx + trigLvl
+            curSL := entPx
+            beDone := true
+        if strategy.position_size < 0 and low <= entPx - trigLvl
+            curSL := entPx
+            beDone := true
+    if exitOnTrendFlip and ((strategy.position_size > 0 and htfTrend != 1) or (strategy.position_size < 0 and htfTrend != -1))
+        strategy.close_all(comment = "тренд H4 сломан")
+    else
+        strategy.exit("X", stop = curSL, limit = curTP)
+
+int   fireDir = 0
+float fireHi  = na
+float fireLo  = na
+float fireZLo = na
+float fireZHi = na
+
+// ---- подтверждение триггера с предыдущих баров
+if trigDir != 0
+    bool windowGone = confirmInsideWindow and winLeft <= 0
+    bool conf = trigDir == 1 ? close > trigHi : close < trigLo
+    if conf and not windowGone
+        fireDir := trigDir
+        fireHi  := trigHi
+        fireLo  := trigLo
+        fireZLo := trigZLo
+        fireZHi := trigZHi
+        trigDir := 0
+    else
+        trigLeft -= 1
+        if trigLeft <= 0 or windowGone
+            trigDir := 0
+            cntNoConf += 1
+
+// ---- касание зоны, окно входа
+float tchLo = na
+float tchHi = na
+if array.size(supPOI) > 0
+    for i = array.size(supPOI) - 1 to 0
+        Zone z = array.get(supPOI, i)
+        bool entered = low <= z.hi and (na(low[1]) or low[1] > z.hi)
+        if bar_index > z.born and entered
+            if na(tchLo) or z.lo < tchLo
+                tchLo := z.lo
+                tchHi := z.hi
+        if bar_index > z.born and freshMode == "strict" and low <= z.hi
+            array.remove(supPOI, i)
+        else if bar_index > z.born and freshMode == "soft" and close < z.lo
+            array.remove(supPOI, i)
+
+float tchResLo = na
+float tchResHi = na
+if array.size(resPOI) > 0
+    for i = array.size(resPOI) - 1 to 0
+        Zone z = array.get(resPOI, i)
+        bool entered = high >= z.lo and (na(high[1]) or high[1] < z.lo)
+        if bar_index > z.born and entered
+            if na(tchResHi) or z.hi > tchResHi
+                tchResLo := z.lo
+                tchResHi := z.hi
+        if bar_index > z.born and freshMode == "strict" and high >= z.lo
+            array.remove(resPOI, i)
+        else if bar_index > z.born and freshMode == "soft" and close > z.hi
+            array.remove(resPOI, i)
+
+if not na(tchLo) and htfTrend == 1 and allowL
+    winDir  := 1
+    winLo   := tchLo
+    winHi   := tchHi
+    winLeft := entryWindow
+    trigDir := 0
+    cntWin  += 1
+else if not na(tchResHi) and htfTrend == -1 and allowS
+    winDir  := -1
+    winLo   := tchResLo
+    winHi   := tchResHi
+    winLeft := entryWindow
+    trigDir := 0
+    cntWin  += 1
+
+// ---- поиск триггерной свечи внутри окна
+if winDir != 0 and winLeft > 0 and trigDir == 0 and fireDir == 0
+    float rng = high - low
+    bool bigEnough = rng >= minRangeAtr * atrv
+    bool rej = false
+    bool swp = false
+    if winDir == 1
+        float wick = math.min(open, close) - low
+        rej := useRejection and rng > 0 and wick >= wickRatio * rng and close > open and low <= winHi and low >= winLo and bigEnough
+        swp := useSweep and low < winLo and close >= winLo
+    else
+        float wick = high - math.max(open, close)
+        rej := useRejection and rng > 0 and wick >= wickRatio * rng and close < open and high >= winLo and high <= winHi and bigEnough
+        swp := useSweep and high > winHi and close <= winHi
+    if rej or swp
+        cntTrig += 1
+        if swp and not rej and not sweepConfirm
+            fireDir := winDir
+            fireHi  := high
+            fireLo  := low
+            fireZLo := winLo
+            fireZHi := winHi
+        else
+            trigDir  := winDir
+            trigLeft := confirmBars
+            trigHi   := high
+            trigLo   := low
+            trigZLo  := winLo
+            trigZHi  := winHi
+
+if winLeft > 0
+    winLeft -= 1
+    if winLeft == 0
+        winDir := 0
+
+// ---- сессия, стоп, цель = tpR × риск, фильтры, вход
+//
+// Сессионный фильтр стоит ПЕРВЫМ: решение «торгуем ли мы сейчас вообще» логически
+// предшествует арифметике риска. Следствие для отчётов: cntBusy / cntMinStop / cntCost
+// становятся условными (до них доходит меньше сетапов) и напрямую с базой
+// не сравниваются. cntSess при этом показывает чистый укус фильтра.
+//
+// Гейтится ТОЛЬКО бар входа. Создание зон, тренд H4, окно входа, свежесть и детект
+// триггеров работают круглосуточно — иначе изменилась бы сама популяция сетапов,
+// и прогон перестал бы измерять заявленную гипотезу. Сетап, чьё окно открылось
+// в Азии и дожило до Лондона, входит нормально.
+if fireDir != 0
+    if not sessionOk
+        cntSess += 1
+    else if strategy.position_size != 0
+        cntBusy += 1
+    else
+        cntEval += 1
+        float entryPx = close
+        float slPx = fireDir == 1 ? math.min(fireZLo, fireLo) - slBufAtr * atrv : math.max(fireZHi, fireHi) + slBufAtr * atrv
+        float risk = fireDir == 1 ? entryPx - slPx : slPx - entryPx
+        float rtCost = 2 * (costPctSide / 100) * entryPx + 2 * slipTicks * syminfo.mintick
+        if risk <= syminfo.mintick * 5 or na(risk)
+            cntMinStop += 1
+        else if risk < minStopAtr * atrv
+            if showMarks
+                label.new(bar_index, fireDir == 1 ? low : high, "стоп<ATR", style = fireDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.gray, 40), textcolor = color.white, size = size.tiny)
+            cntMinStop += 1
+        else if risk < kCost * rtCost
+            if showMarks
+                label.new(bar_index, fireDir == 1 ? low : high, "издержки", style = fireDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(color.orange, 50), textcolor = color.white, size = size.tiny)
+            cntCost += 1
+        else
+            float tpPx = fireDir == 1 ? entryPx + tpR * risk : entryPx - tpR * risk
+            float qty = strategy.equity * riskPct / 100 / risk
+            curSL := slPx
+            curTP := tpPx
+            entR  := risk
+            entPx := entryPx
+            beDone := false
+            cntEnt += 1
+            array.push(pendR, strategy.equity * riskPct / 100)
+            // freshMode = soft: зона умирает именно от входа
+            if freshMode == "soft"
+                if fireDir == 1
+                    f_killByBounds(supPOI, fireZLo, fireZHi)
+                else
+                    f_killByBounds(resPOI, fireZLo, fireZHi)
+            if fireDir == 1
+                strategy.entry("MSNR L", strategy.long, qty = qty)
+            else
+                strategy.entry("MSNR S", strategy.short, qty = qty)
+            strategy.exit("X", stop = slPx, limit = tpPx)
+
+// ================= ОТОБРАЖЕНИЕ =================
+bgcolor(htfTrend == 1 ? color.new(color.teal, 94) : htfTrend == -1 ? color.new(color.maroon, 94) : na)
+
+string sessTxt = sessOff ? "—" : (lonOn ? lonSess : "·") + "/" + (nyOn ? nySess : "·")
+
+string cfg = "MSNR v1.3 " + syminfo.ticker + " " + tfTrend + "/" + tfZone + "/" + timeframe.period +
+     " tpR" + str.tostring(tpR, "#.#") + " be=" + beMode + " trend=" + trendMode + " fresh=" + freshMode +
+     (bornFresh ? "+born" : "-born") + " swpConf=" + (sweepConfirm ? "1" : "0") +
+     " w" + str.tostring(entryWindow) + " zp" + str.tostring(zonePivot) +
+     " minSL" + str.tostring(minStopAtr, "#.#") + "ATR k" + str.tostring(kCost, "#.#") +
+     " ком" + str.tostring(costPctSide, "#.###") + "%" +
+     " sess=" + sessTxt
+
+float medR = f_median(rMults)
+float medD = f_median(durs)
+float maxWinR = 0.0
+float maxLosR = 0.0
+if array.size(rMults) > 0
+    maxWinR := array.max(rMults)
+    maxLosR := array.min(rMults)
+
+var table t = table.new(position.top_right, 1, 3)
+if barstate.islastconfirmedhistory or barstate.islast
+    table.cell(t, 0, 0, cfg, text_color = color.white, bgcolor = color.new(color.navy, 20), text_size = size.small)
+    table.cell(t, 0, 1, "воронка: окон " + str.tostring(cntWin) + " → триггеров " + str.tostring(cntTrig) +
+         " → без подтв. " + str.tostring(cntNoConf) + " → сессия " + str.tostring(cntSess) +
+         " → оценок " + str.tostring(cntEval) +
+         " | стоп<мин " + str.tostring(cntMinStop) + " | издержки " + str.tostring(cntCost) +
+         " | занято " + str.tostring(cntBusy) + " → входов " + str.tostring(cntEnt),
+         text_color = color.white, bgcolor = color.new(color.navy, 40), text_size = size.small)
+    table.cell(t, 0, 2, "закрыто " + str.tostring(strategy.closedtrades) +
+         " | R: макс+" + str.tostring(maxWinR, "#.##") + " макс−" + str.tostring(maxLosR, "#.##") +
+         " медиана " + str.tostring(medR, "#.##") +
+         " | длит. медиана " + str.tostring(medD, "#") + " баров",
+         text_color = color.white, bgcolor = color.new(color.navy, 60), text_size = size.small)
