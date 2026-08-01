@@ -212,6 +212,18 @@ color C_FLIPB = color.new(color.orange, 40)
 color C_DEAD  = color.new(color.gray, 92)
 color C_DEADB = color.new(color.gray, 70)
 
+// Жива ли зона — то есть лежит ли она ещё в пуле. Мёртвые (Filled/Inverted/Expired)
+// и снятые прунингом из массива удаляются, поэтому присутствие = жизнь.
+f_zoneAlive(array<Fvg> zs, int zid) =>
+    bool found = false
+    if zid >= 0 and array.size(zs) > 0
+        for i = 0 to array.size(zs) - 1
+            Fvg z = array.get(zs, i)
+            if z.id == zid
+                found := true
+                break
+    found
+
 f_markUsed(array<Fvg> zs, int zid) =>
     if zid >= 0 and array.size(zs) > 0
         for i = 0 to array.size(zs) - 1
@@ -319,6 +331,8 @@ var int cntPart   = 0
 var int cntLiqFb  = 0
 var int cntTS     = 0      // групп, закрытых тайм-стопом (v1.1)
 var int cntPrune  = 0      // зон снято прунингом при переполнении maxZonesSide
+var int cntArmDead = 0     // лимиток снято/заменено из-за смерти их зоны
+var int cntGhost   = 0     // ВХОДОВ ОТ УЖЕ СНЯТОЙ ЗОНЫ — обязан остаться 0
 
 var bool tsArmed = false   // по текущей группе выдан strategy.close по тайм-стопу
 
@@ -348,6 +362,11 @@ if newEntry
     float qty0 = entDir == 1 ? armLqty : armSqty
     int   zid0 = entDir == 1 ? armLz : armSz
     float rd   = math.abs(entPx - sl0)
+    // Ассерт приёмки (этап 0, пункт 5a): зона, по которой пришло исполнение, обязана быть
+    // живой на начало этого бара. Секции 2 (смерть зон) и 3 (прунинг) ещё не отработали,
+    // поэтому счётчик ловит ровно то, что нужно, — ордер, переживший снятие своей зоны.
+    if not f_zoneAlive(zones, zid0)
+        cntGhost += 1
     curEB      := bar_index
     curDir     := entDir
     curEntPx   := entPx
@@ -594,6 +613,15 @@ if array.size(zones) > 0 and not na(atrv)
 
 bool anyCand = bLz >= 0 or bSz >= 0
 
+// Зона выставленной лимитки умерла на этом баре (Filled/Inverted/Expired или прунинг)?
+// Секции 2 и 3 уже отработали, значит её нет в пуле. Ордер ниже будет либо заменён ценой
+// другой зоны, либо снят — пережить бар своей смерти он не может. Счётчик показывает,
+// что механизм на окне реально срабатывал, а не что проверка вырожденная.
+if armLz >= 0 and not f_zoneAlive(zones, armLz)
+    cntArmDead += 1
+if armSz >= 0 and not f_zoneAlive(zones, armSz)
+    cntArmDead += 1
+
 if strategy.position_size != 0
     // в позиции новых лимиток не держим: встречная сделка развернула бы позицию
     if anyCand
@@ -719,7 +747,9 @@ if showTable and (barstate.islast or barstate.islastconfirmedhistory)
          " | входов " + str.tostring(cntEnt) +
          " | частичных " + str.tostring(cntPart) +
          " | закрыто по тайм-стопу " + str.tostring(cntTS) +
-         " (" + str.tostring(nEnt > 0 ? float(cntTS) / nEnt * 100 : 0.0, "#.#") + "% сделок)",
+         " (" + str.tostring(nEnt > 0 ? float(cntTS) / nEnt * 100 : 0.0, "#.#") + "% сделок)" +
+         " | лимиток снято по смерти зоны " + str.tostring(cntArmDead) +
+         " | входов от снятой зоны " + str.tostring(cntGhost) + " (обязан быть 0)",
          text_color = color.white, bgcolor = color.new(color.navy, 65), text_size = size.small, text_halign = text.align_left)
     string isTxt = "IS/OOS выключен (вкл. в блоке «Отчёт»)"
     if useSplit
