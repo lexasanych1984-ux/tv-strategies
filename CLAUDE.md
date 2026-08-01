@@ -27,7 +27,11 @@ fx-indices/   — FX и индексы
   - `commission_type = strategy.commission.percent`
   - `commission_value = 0.055`
   - `slippage = 2`
-- `calc_on_every_tick = false`, `process_orders_on_close = true`.
+- `calc_on_every_tick = false`.
+- `process_orders_on_close = true` — для стратегий со входом **по рынку на закрытии бара**.
+  **Исключение:** стратегии с **лимитными** входами используют `process_orders_on_close = false` —
+  иначе лимитка исполняется по цене закрытия сигнального бара, что оптимистичнее реального
+  исполнения. Исключение применено в `fvg-1h-trend/`.
 - `request.security()` — **только** с `lookahead = barmerge.lookahead_off` и подтверждёнными барами
   старшего ТФ (`[1]` на серии, либо `barstate.isconfirmed` в логике). Никакого repainting.
 - Все параметры (периоды, множители, пороги фильтров) выносить в `input.*` с группировкой
