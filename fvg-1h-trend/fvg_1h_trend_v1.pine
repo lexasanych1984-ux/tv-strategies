@@ -1,0 +1,695 @@
+//@version=6
+// ============================================================================
+//  fvg_1h_trend_v1 — «FVG 1h по тренду», параметризованный стенд для A/B
+//
+//  ТЗ: TZ_fvg-1h-trend_v1.md. Матрица 3 входа × 3 стопа × 3 тейка × 3 фильтра
+//  направления + сессии + режим митигации. Все правила — input, ничего не
+//  захардкожено. Прогоны — вручную, по одному изменению за раз (см. README).
+//
+//  Changelog
+//  v1 (2026-08-01)  первая версия:
+//      · детекция FVG по 3 свечам с фильтрами качества (размер, displacement);
+//      · конечный автомат зон, пересканирование пула на КАЖДОМ баре
+//        (урок smc-2koleno-v24: не снапшотить POI один раз на баре сигнала);
+//      · лимитные входы через OCA-пару, стоп активен с бара исполнения;
+//      · четыре оси матрицы, сессионный фильтр, wick/close-митигация, IFVG;
+//      · таблица метрик: экспектанси считается ПО ВХОДАМ из фактического
+//        pnl/risk$, а не формулой «winrate × RR» (см. smc-v25-poi-backtest-criteria).
+//
+//  Порядок объявления input.* фиксирован — внешние прогонщики адресуют их как
+//  in_N. Новые инпуты добавлять ТОЛЬКО в конец блока инпутов.
+// ============================================================================
+
+strategy("FVG 1h Trend v1", "FVG1h v1", overlay = true,
+     initial_capital = 10000, pyramiding = 0,
+     default_qty_type = strategy.fixed, default_qty_value = 1,
+     margin_long = 0, margin_short = 0,
+     commission_type = strategy.commission.percent, commission_value = 0.055, slippage = 3,
+     calc_on_every_tick = false, process_orders_on_close = false,
+     max_bars_back = 1000, max_boxes_count = 500, max_labels_count = 100, max_lines_count = 50)
+
+// ============================ ИНПУТЫ ========================================
+
+// ---------- Блок 1 · Детекция FVG ----------
+string GD = "Блок 1 · Детекция FVG"
+int    atrLen      = input.int(14, "ATR, период", minval = 2, group = GD)
+float  minGapATR   = input.float(0.3, "Мин. размер гэпа, ×ATR", minval = 0.0, maxval = 3.0, step = 0.05, group = GD)
+float  maxGapATR   = input.float(3.0, "Макс. размер гэпа, ×ATR (0 = выкл)", minval = 0.0, step = 0.1, group = GD)
+float  dispBodyPct = input.float(65, "Displacement: тело/диапазон свечи №2, % (0 = выкл)", minval = 0, maxval = 100, step = 1, group = GD)
+float  dispATRmult = input.float(1.0, "Displacement: тело свечи №2 ≥ ×ATR (0 = выкл)", minval = 0.0, step = 0.1, group = GD)
+int    minAgeBars  = input.int(1, "Мин. возраст зоны до лимитки, баров", minval = 0, maxval = 20,
+     tooltip = "0 — лимитка выставляется на баре формирования зоны (исполнение всё равно со следующего бара).", group = GD)
+
+// ---------- Блок 2 · Жизненный цикл зоны ----------
+string GL = "Блок 2 · Жизненный цикл зоны"
+string mitigationMode   = input.string("close", "Митигация считается по", options = ["close", "wick"], group = GL)
+float  fillThresholdPct = input.float(100, "Зона отработана при заполнении на, %", minval = 10, maxval = 100, step = 10, group = GL)
+int    expiryBars       = input.int(30, "Срок жизни зоны, баров", minval = 5, maxval = 300, group = GL)
+string ifvgMode         = input.string("remove", "Закрытие за дистальной границей", options = ["remove", "flip"],
+     tooltip = "remove — зона снимается. flip — зона инвертируется и торгуется в обратную сторону (ветка IFVG, этап 5).", group = GL)
+bool   oneTradePerZone  = input.bool(true, "Одна зона = максимум один вход", group = GL)
+int    maxZonesSide     = input.int(20, "Макс. живых зон в каждую сторону", minval = 1, maxval = 100,
+     tooltip = "При переполнении удаляется самая старая зона этого направления.", group = GL)
+
+// ---------- Ось A · Вход ----------
+string GA = "Ось A · Вход"
+string entryMode = input.string("ce", "Уровень лимитки", options = ["proximal", "ce", "distal"], group = GA)
+
+// ---------- Ось B · Стоп ----------
+string GB = "Ось B · Стоп"
+string stopMode      = input.string("distalBuf", "Стоп", options = ["distalBuf", "originCandle", "swing"], group = GB)
+float  stopBufferATR = input.float(0.1, "Буфер за уровнем стопа, ×ATR", minval = 0.0, step = 0.05,
+     tooltip = "Для GBPJPY и GER40 ставить 0.3 (волатильность, выбивание тенями).", group = GB)
+int    pivotLen      = input.int(5, "Пивот свингов (слева = справа)", minval = 2, maxval = 20, group = GB)
+
+// ---------- Ось C · Тейк ----------
+string GC = "Ось C · Тейк"
+string tpMode        = input.string("rr2", "Тейк", options = ["rr2", "rr3", "liquidity"], group = GC)
+bool   partialTP     = input.bool(false, "50% на 1R, остаток к цели, стоп в БУ", group = GC)
+float  liqMinRR      = input.float(1.0, "liquidity: минимальный RR цели", minval = 0.2, step = 0.1, group = GC)
+float  liqFallbackRR = input.float(2.0, "liquidity: RR, если подходящего свинга нет", minval = 0.5, step = 0.5, group = GC)
+
+// ---------- Ось D · Фильтр направления ----------
+string GT = "Ось D · Фильтр направления"
+string trendMode = input.string("ema200", "Фильтр тренда", options = ["none", "ema200", "htfBos"], group = GT)
+int    emaLen    = input.int(200, "EMA, период (режим ema200)", minval = 10, group = GT)
+string bosTF     = input.timeframe("240", "ТФ структуры (режим htfBos)", group = GT)
+int    bosPiv    = input.int(3, "Пивот структуры HTF", minval = 1, maxval = 10, group = GT)
+
+// ---------- Доп. фильтр · Сессии ----------
+string GS = "Доп. фильтр · Сессии"
+bool   sessionFilter = input.bool(false, "Включить сессионный фильтр", group = GS)
+string sessTZ = input.string("America/New_York", "Часовой пояс окон", group = GS)
+string sess1  = input.string("0200-0500:1234567", "Окно 1 · London", group = GS)
+string sess2  = input.string("0800-1100:1234567", "Окно 2 · NY AM", group = GS)
+string sess3  = input.string("", "Окно 3 · Frankfurt для GER40 (пусто = выкл)",
+     tooltip = "Для GER40: 0300-0500:1234567.", group = GS)
+
+// ---------- Риск ----------
+string GR = "Риск"
+float  riskPct = input.float(1.0, "Риск на сделку, % от эквити", minval = 0.05, step = 0.05, group = GR)
+
+// ---------- Отчёт ----------
+string GO = "Отчёт и отображение"
+bool showZones = input.bool(true, "Рисовать зоны", group = GO)
+bool showTable = input.bool(true, "Таблица метрик", group = GO)
+bool showArmed = input.bool(true, "Показывать выставленные лимитки", group = GO)
+bool useSplit  = input.bool(false, "Делить окно на in-sample / out-of-sample", group = GO)
+int  splitTime = input.time(timestamp("01 Jan 2024 00:00 +0000"), "Дата раздела IS/OOS", group = GO)
+
+// ============================ БАЗОВЫЕ СЕРИИ =================================
+
+float atrv = ta.atr(atrLen)
+float emaV = ta.ema(close, emaLen)
+
+// Свинги рабочего ТФ: подтверждённые пивоты (значение приходит с задержкой pivotLen баров,
+// поэтому заглядывания вперёд нет). Нужны для stopMode=swing и tpMode=liquidity.
+float pvh = ta.pivothigh(pivotLen, pivotLen)
+float pvl = ta.pivotlow(pivotLen, pivotLen)
+
+var array<float> pivHi = array.new_float()
+var array<float> pivLo = array.new_float()
+if not na(pvh)
+    array.push(pivHi, pvh)
+    if array.size(pivHi) > 20
+        array.shift(pivHi)
+if not na(pvl)
+    array.push(pivLo, pvl)
+    if array.size(pivLo) > 20
+        array.shift(pivLo)
+
+float lastPivHi = array.size(pivHi) > 0 ? array.get(pivHi, array.size(pivHi) - 1) : na
+float lastPivLo = array.size(pivLo) > 0 ? array.get(pivLo, array.size(pivLo) - 1) : na
+
+// Структура старшего ТФ: BOS/CHoCH по пивотам. Возвращается b[1] — значение
+// ПРЕДЫДУЩЕГО закрытого бара HTF, поэтому bias не переобувается внутри
+// формирующейся 4h-свечи. lookahead_off обязателен.
+f_htfBias() =>
+    float ph = ta.pivothigh(bosPiv, bosPiv)
+    float pl = ta.pivotlow(bosPiv, bosPiv)
+    var float lastH = na
+    var float lastL = na
+    var int   b = 0
+    if not na(ph)
+        lastH := ph
+    if not na(pl)
+        lastL := pl
+    if not na(lastH) and close > lastH
+        b := 1
+        lastH := na
+    if not na(lastL) and close < lastL
+        b := -1
+        lastL := na
+    b[1]
+
+int htfBias = nz(request.security(syminfo.tickerid, bosTF, f_htfBias(), lookahead = barmerge.lookahead_off))
+
+bool trendUp = trendMode == "none" ? true : trendMode == "ema200" ? close > emaV : htfBias == 1
+bool trendDn = trendMode == "none" ? true : trendMode == "ema200" ? close < emaV : htfBias == -1
+
+// Сессии. Пустая строка = окно выключено; time() требует валидный спек, поэтому
+// подставляется заглушка, результат которой отбрасывается флагом.
+string SESS_DUMMY = "0900-1000:1234567"
+bool s1on = str.length(sess1) > 0
+bool s2on = str.length(sess2) > 0
+bool s3on = str.length(sess3) > 0
+bool inS1 = s1on and not na(time(timeframe.period, s1on ? sess1 : SESS_DUMMY, sessTZ))
+bool inS2 = s2on and not na(time(timeframe.period, s2on ? sess2 : SESS_DUMMY, sessTZ))
+bool inS3 = s3on and not na(time(timeframe.period, s3on ? sess3 : SESS_DUMMY, sessTZ))
+bool sessionOk = not sessionFilter or inS1 or inS2 or inS3
+
+// ============================ ЗОНЫ ==========================================
+// Состояния: 0 Active → 1 Tapped → 2 CE_Tagged → 3 Filled → 4 Inverted → 5 Expired.
+// Хранение — массив объектов, а не параллельные массивы из ТЗ: индексы не могут
+// разъехаться при удалении зоны. Набор полей тот же (уровни, состояние, время
+// создания, ссылка на box).
+type Fvg
+    int   id
+    int   dir      // +1 бычья (лонг), -1 медвежья (шорт)
+    float top
+    float bot
+    float origHi   // экстремумы импульсной свечи (№2 паттерна)
+    float origLo
+    float swHi     // последний подтверждённый свинг до импульса
+    float swLo
+    int   born
+    int   state
+    bool  used
+    bool  noStop
+    bool  flipped
+    box   bx
+
+var array<Fvg> zones = array.new<Fvg>()
+var int zSeq = 0
+
+color C_BULL  = color.new(color.teal, 85)
+color C_BULLB = color.new(color.teal, 40)
+color C_BEAR  = color.new(color.maroon, 85)
+color C_BEARB = color.new(color.maroon, 40)
+color C_FLIP  = color.new(color.orange, 85)
+color C_FLIPB = color.new(color.orange, 40)
+color C_DEAD  = color.new(color.gray, 92)
+color C_DEADB = color.new(color.gray, 70)
+
+f_markUsed(array<Fvg> zs, int zid) =>
+    if zid >= 0 and array.size(zs) > 0
+        for i = 0 to array.size(zs) - 1
+            Fvg z = array.get(zs, i)
+            if z.id == zid
+                z.used := true
+
+f_pruneSide(array<Fvg> zs, int dir, int cap) =>
+    int cnt = 0
+    if array.size(zs) > 0
+        for i = 0 to array.size(zs) - 1
+            Fvg zi = array.get(zs, i)
+            if zi.dir == dir
+                cnt += 1
+    while cnt > cap
+        int victim = -1
+        for i = 0 to array.size(zs) - 1
+            Fvg zj = array.get(zs, i)
+            if zj.dir == dir
+                victim := i
+                break
+        if victim < 0
+            break
+        Fvg z = array.get(zs, victim)
+        if not na(z.bx)
+            box.delete(z.bx)
+        array.remove(zs, victim)
+        cnt -= 1
+
+// ============================ СОСТОЯНИЕ =====================================
+
+// текущая группа сделок (один вход = одна группа, частичные закрытия суммируются)
+var float prevPos    = 0.0
+var int   lastClosed = 0
+var int   curEB      = -1
+var int   curDir     = 0
+var float curRisk    = na
+var float curPnl     = 0.0
+var bool  curOpen    = false
+var int   curEntTime = 0
+var float curEntPx   = na
+var float curSL      = na
+var float curTP      = na
+var float curTP1     = na
+var bool  partDone   = false
+
+// выставленные лимитки (значения живут до следующего бара — по ним опознаётся исполнение)
+var float armLpx  = na
+var float armLsl  = na
+var float armLtp  = na
+var float armLqty = na
+var int   armLz   = -1
+var float armSpx  = na
+var float armSsl  = na
+var float armStp  = na
+var float armSqty = na
+var int   armSz   = -1
+
+// метрики по входам
+var array<float> rArr = array.new_float()
+var int   nEnt   = 0
+var int   nWin   = 0
+var float sumR   = 0.0
+var float gpR    = 0.0
+var float glR    = 0.0
+var float sumDur = 0.0
+var float commPaid = 0.0
+
+var int   nIS   = 0
+var int   wIS   = 0
+var float gpIS  = 0.0
+var float glIS  = 0.0
+var float sRIS  = 0.0
+var int   nOS   = 0
+var int   wOS   = 0
+var float gpOS  = 0.0
+var float glOS  = 0.0
+var float sROS  = 0.0
+
+var float peakEq  = strategy.initial_capital
+var float maxDDp  = 0.0
+var int   barsIn  = 0
+
+// счётчики воронки
+var int cntRaw    = 0
+var int cntRejSz  = 0
+var int cntRejDsp = 0
+var int cntNew    = 0
+var int cntTap    = 0
+var int cntCE     = 0
+var int cntFilled = 0
+var int cntInv    = 0
+var int cntFlip   = 0
+var int cntExp    = 0
+var int cntNoStop = 0
+var int cntSessB  = 0
+var int cntBusyB  = 0
+var int cntEnt    = 0
+var int cntPart   = 0
+var int cntLiqFb  = 0
+
+// ============================ 1. УЧЁТ СДЕЛОК ================================
+// Читается ДО перевыставления лимиток: arm*-переменные ещё хранят уровни,
+// с которыми ордер стоял на предыдущем баре, — именно они и исполнились.
+
+int  nowClosed    = strategy.closedtrades
+bool closesThisBar = nowClosed > lastClosed
+
+bool  newEntry = false
+int   entDir   = 0
+float entPx    = na
+
+if strategy.position_size != 0 and prevPos == 0
+    newEntry := true
+    entDir   := strategy.position_size > 0 ? 1 : -1
+    entPx    := strategy.opentrades.entry_price(0)
+else if closesThisBar and strategy.closedtrades.entry_bar_index(nowClosed - 1) == bar_index
+    // вход и выход уложились в один бар
+    newEntry := true
+    entDir   := strategy.closedtrades.size(nowClosed - 1) > 0 ? 1 : -1
+    entPx    := strategy.closedtrades.entry_price(nowClosed - 1)
+
+if newEntry
+    float sl0  = entDir == 1 ? armLsl : armSsl
+    float qty0 = entDir == 1 ? armLqty : armSqty
+    int   zid0 = entDir == 1 ? armLz : armSz
+    float rd   = math.abs(entPx - sl0)
+    curEB      := bar_index
+    curDir     := entDir
+    curEntPx   := entPx
+    curEntTime := time
+    curSL      := sl0
+    curRisk    := qty0 * rd
+    curPnl     := 0.0
+    curOpen    := true
+    partDone   := false
+    curTP1     := entDir == 1 ? entPx + rd : entPx - rd
+    curTP      := tpMode == "liquidity" ? (entDir == 1 ? armLtp : armStp) :
+         (entDir == 1 ? entPx + (tpMode == "rr3" ? 3.0 : 2.0) * rd : entPx - (tpMode == "rr3" ? 3.0 : 2.0) * rd)
+    cntEnt += 1
+    if oneTradePerZone
+        f_markUsed(zones, zid0)
+
+// частичная фиксация: часть позиции закрылась, позиция ещё жива → стоп в БУ
+if partialTP and curOpen and closesThisBar and strategy.position_size != 0 and not partDone
+    partDone := true
+    curSL    := curEntPx
+    cntPart  += 1
+
+if closesThisBar
+    for k = lastClosed to nowClosed - 1
+        curPnl   += strategy.closedtrades.profit(k)
+        commPaid += strategy.closedtrades.commission(k)
+    lastClosed := nowClosed
+
+// группа закрыта целиком → фиксируем R и длительность
+if curOpen and strategy.position_size == 0
+    if not na(curRisk) and curRisk > 0
+        float r0 = curPnl / curRisk
+        array.push(rArr, r0)
+        nEnt   += 1
+        sumR   += r0
+        sumDur += bar_index - curEB
+        if r0 > 0
+            nWin += 1
+            gpR  += r0
+        else
+            glR += math.abs(r0)
+        if curEntTime < splitTime
+            nIS += 1
+            sRIS += r0
+            if r0 > 0
+                wIS += 1
+                gpIS += r0
+            else
+                glIS += math.abs(r0)
+        else
+            nOS += 1
+            sROS += r0
+            if r0 > 0
+                wOS += 1
+                gpOS += r0
+            else
+                glOS += math.abs(r0)
+    curOpen := false
+
+if strategy.position_size != 0
+    barsIn += 1
+
+peakEq := math.max(peakEq, strategy.equity)
+maxDDp := math.max(maxDDp, peakEq > 0 ? (peakEq - strategy.equity) / peakEq * 100 : 0.0)
+
+// ============================ 2. ЖИЗНЕННЫЙ ЦИКЛ ЗОН =========================
+// Пул пересканируется на КАЖДОМ баре целиком — снапшотов нет.
+
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        Fvg z = array.get(zones, i)
+        if bar_index > z.born
+            float span   = z.top - z.bot
+            float ceLvl  = (z.top + z.bot) / 2
+            float mitPx  = mitigationMode == "wick" ? (z.dir == 1 ? low : high) : close
+            float fillLvl = z.dir == 1 ? z.top - span * fillThresholdPct / 100 : z.bot + span * fillThresholdPct / 100
+            bool tapped   = z.dir == 1 ? mitPx <= z.top : mitPx >= z.bot
+            bool ceTag    = z.dir == 1 ? mitPx <= ceLvl : mitPx >= ceLvl
+            bool filled   = z.dir == 1 ? mitPx <= fillLvl : mitPx >= fillLvl
+            bool inverted = z.dir == 1 ? close < z.bot : close > z.top
+            if z.state < 1 and tapped
+                z.state := 1
+                cntTap += 1
+            if z.state < 2 and ceTag
+                z.state := 2
+                cntCE += 1
+            bool kill = false
+            if inverted and ifvgMode == "flip" and not z.flipped
+                z.dir     := -z.dir
+                z.flipped := true
+                z.state   := 0
+                z.born    := bar_index
+                z.used    := false
+                z.noStop  := false
+                cntFlip   += 1
+                if showZones and not na(z.bx)
+                    box.set_bgcolor(z.bx, C_FLIP)
+                    box.set_border_color(z.bx, C_FLIPB)
+            else if filled
+                z.state := 3
+                kill := true
+                cntFilled += 1
+            else if inverted
+                z.state := 4
+                kill := true
+                cntInv += 1
+            else if bar_index - z.born > expiryBars
+                z.state := 5
+                kill := true
+                cntExp += 1
+            if kill
+                if showZones and not na(z.bx)
+                    box.set_right(z.bx, bar_index)
+                    box.set_bgcolor(z.bx, C_DEAD)
+                    box.set_border_color(z.bx, C_DEADB)
+                array.remove(zones, i)
+            else if showZones and not na(z.bx)
+                box.set_right(z.bx, bar_index)
+
+// ============================ 3. ДЕТЕКЦИЯ НОВЫХ ЗОН =========================
+// Ссылки только на закрытые бары: гэп между high[2]/low[2] и текущим баром,
+// импульсная свеча — [1]. Зона попадает в пул сразу, включая FVG, образованный
+// импульсом самого входа.
+
+bool bullRaw = low > high[2] and close[1] > high[2]
+bool bearRaw = high < low[2] and close[1] < low[2]
+
+if (bullRaw or bearRaw) and not na(atrv) and atrv > 0
+    cntRaw += 1
+    float zTop   = bullRaw ? low : low[2]
+    float zBot   = bullRaw ? high[2] : high
+    float gap    = zTop - zBot
+    float b1Body = math.abs(close[1] - open[1])
+    float b1Rng  = high[1] - low[1]
+    bool okSize  = gap >= minGapATR * atrv and (maxGapATR <= 0 or gap <= maxGapATR * atrv)
+    bool okDisp  = (dispBodyPct <= 0 or (b1Rng > 0 and b1Body / b1Rng * 100 >= dispBodyPct)) and
+         (dispATRmult <= 0 or b1Body >= dispATRmult * atrv)
+    if not okSize
+        cntRejSz += 1
+    else if not okDisp
+        cntRejDsp += 1
+    else
+        zSeq += 1
+        Fvg z = Fvg.new(id = zSeq, dir = bullRaw ? 1 : -1, top = zTop, bot = zBot,
+             origHi = high[1], origLo = low[1], swHi = lastPivHi, swLo = lastPivLo,
+             born = bar_index, state = 0, used = false, noStop = false, flipped = false, bx = na)
+        if showZones
+            z.bx := box.new(bar_index - 2, zTop, bar_index, zBot,
+                 border_color = bullRaw ? C_BULLB : C_BEARB, bgcolor = bullRaw ? C_BULL : C_BEAR)
+        array.push(zones, z)
+        cntNew += 1
+        f_pruneSide(zones, z.dir, maxZonesSide)
+
+// ============================ 4. ВЕДЕНИЕ ПОЗИЦИИ ============================
+// Стоп/тейк пересчитаны от ФАКТИЧЕСКОЙ цены исполнения (лимитка может исполниться
+// лучше уровня на гэпе). Сессия здесь не участвует: открытая позиция ведётся
+// до стопа/тейка независимо от окна.
+
+if strategy.position_size != 0
+    string eid = curDir == 1 ? "L" : "S"
+    if partialTP and not partDone
+        strategy.exit(eid + "-TP1", from_entry = eid, qty_percent = 50, stop = curSL, limit = curTP1,
+             comment_profit = "TP1", comment_loss = "SL")
+    strategy.exit(eid + "-X", from_entry = eid, stop = curSL, limit = curTP,
+         comment_profit = "TP", comment_loss = "SL")
+
+// ============================ 5. ПОДБОР ЗОН И ЛИМИТКИ =======================
+// Из каждой стороны берётся БЛИЖАЙШАЯ к цене валидная зона: именно её уровень
+// цена достигнет первой, поэтому одна лимитка на сторону эквивалентна лимиткам
+// во всех зонах при pyramiding = 0.
+
+float bLpx = na
+float bLsl = na
+float bLtp = na
+int   bLz  = -1
+float bSpx = na
+float bSsl = na
+float bStp = na
+int   bSz  = -1
+
+if array.size(zones) > 0 and not na(atrv)
+    for i = 0 to array.size(zones) - 1
+        Fvg z = array.get(zones, i)
+        bool skip = z.used or (bar_index - z.born < minAgeBars) or not (z.dir == 1 ? trendUp : trendDn)
+        if not skip
+            float ePx = entryMode == "proximal" ? (z.dir == 1 ? z.top : z.bot) :
+                 entryMode == "distal" ? (z.dir == 1 ? z.bot : z.top) : (z.top + z.bot) / 2
+            // лимитка должна стоять по ту сторону рынка, иначе исполнение мгновенное
+            bool priceOk = z.dir == 1 ? ePx < close : ePx > close
+            if priceOk
+                float sPx = stopMode == "originCandle" ? (z.dir == 1 ? z.origLo - stopBufferATR * atrv : z.origHi + stopBufferATR * atrv) :
+                     stopMode == "swing" ? (z.dir == 1 ? z.swLo - stopBufferATR * atrv : z.swHi + stopBufferATR * atrv) :
+                     (z.dir == 1 ? z.bot - stopBufferATR * atrv : z.top + stopBufferATR * atrv)
+                // стоп не может оказаться внутри зоны
+                bool slOk = not na(sPx) and (z.dir == 1 ? (sPx <= z.bot and sPx < ePx) : (sPx >= z.top and sPx > ePx))
+                float risk = math.abs(ePx - sPx)
+                if not slOk or risk < syminfo.mintick * 5
+                    if not z.noStop
+                        z.noStop := true
+                        cntNoStop += 1
+                else
+                    float tPx = na
+                    if tpMode == "liquidity"
+                        float best = na
+                        if z.dir == 1
+                            if array.size(pivHi) > 0
+                                for j = 0 to array.size(pivHi) - 1
+                                    float p = array.get(pivHi, j)
+                                    if p > ePx + risk * liqMinRR and (na(best) or p < best)
+                                        best := p
+                        else
+                            if array.size(pivLo) > 0
+                                for j = 0 to array.size(pivLo) - 1
+                                    float p = array.get(pivLo, j)
+                                    if p < ePx - risk * liqMinRR and (na(best) or p > best)
+                                        best := p
+                        if na(best)
+                            tPx := z.dir == 1 ? ePx + liqFallbackRR * risk : ePx - liqFallbackRR * risk
+                        else
+                            tPx := best
+                    else
+                        float rr = tpMode == "rr3" ? 3.0 : 2.0
+                        tPx := z.dir == 1 ? ePx + rr * risk : ePx - rr * risk
+                    if z.dir == 1
+                        if na(bLpx) or ePx > bLpx
+                            bLpx := ePx
+                            bLsl := sPx
+                            bLtp := tPx
+                            bLz  := z.id
+                    else
+                        if na(bSpx) or ePx < bSpx
+                            bSpx := ePx
+                            bSsl := sPx
+                            bStp := tPx
+                            bSz  := z.id
+
+bool anyCand = bLz >= 0 or bSz >= 0
+
+if strategy.position_size != 0
+    // в позиции новых лимиток не держим: встречная сделка развернула бы позицию
+    if anyCand
+        cntBusyB += 1
+    strategy.cancel("L")
+    strategy.cancel("S")
+    armLz := -1
+    armSz := -1
+else if not sessionOk
+    if anyCand
+        cntSessB += 1
+    strategy.cancel("L")
+    strategy.cancel("S")
+    armLz := -1
+    armSz := -1
+else
+    if bLz >= 0
+        armLpx  := bLpx
+        armLsl  := bLsl
+        armLtp  := bLtp
+        armLz   := bLz
+        armLqty := strategy.equity * riskPct / 100 / math.abs(bLpx - bLsl)
+        strategy.entry("L", strategy.long, qty = armLqty, limit = bLpx,
+             oca_name = "FVGENT", oca_type = strategy.oca.cancel, comment = "L z" + str.tostring(bLz))
+        if partialTP
+            strategy.exit("L-TP1", from_entry = "L", qty_percent = 50, stop = bLsl, limit = bLpx + (bLpx - bLsl),
+                 comment_profit = "TP1", comment_loss = "SL")
+        strategy.exit("L-X", from_entry = "L", stop = bLsl, limit = bLtp, comment_profit = "TP", comment_loss = "SL")
+    else
+        strategy.cancel("L")
+        armLz := -1
+    if bSz >= 0
+        armSpx  := bSpx
+        armSsl  := bSsl
+        armStp  := bStp
+        armSz   := bSz
+        armSqty := strategy.equity * riskPct / 100 / math.abs(bSpx - bSsl)
+        strategy.entry("S", strategy.short, qty = armSqty, limit = bSpx,
+             oca_name = "FVGENT", oca_type = strategy.oca.cancel, comment = "S z" + str.tostring(bSz))
+        if partialTP
+            strategy.exit("S-TP1", from_entry = "S", qty_percent = 50, stop = bSsl, limit = bSpx - (bSsl - bSpx),
+                 comment_profit = "TP1", comment_loss = "SL")
+        strategy.exit("S-X", from_entry = "S", stop = bSsl, limit = bStp, comment_profit = "TP", comment_loss = "SL")
+    else
+        strategy.cancel("S")
+        armSz := -1
+
+prevPos := strategy.position_size
+
+// ============================ 6. ОТОБРАЖЕНИЕ ================================
+
+plot(showArmed and armLz >= 0 and strategy.position_size == 0 ? armLpx : na, "Лимитка L",
+     color.new(color.lime, 0), 1, plot.style_circles)
+plot(showArmed and armSz >= 0 and strategy.position_size == 0 ? armSpx : na, "Лимитка S",
+     color.new(color.red, 0), 1, plot.style_circles)
+plot(strategy.position_size != 0 ? curSL : na, "Стоп", color.new(color.red, 20), 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? curTP : na, "Тейк", color.new(color.teal, 20), 1, plot.style_linebr)
+bgcolor(trendMode == "none" ? na : trendUp ? color.new(color.teal, 95) : trendDn ? color.new(color.maroon, 95) : na)
+
+f_median(array<float> a) =>
+    float m = na
+    if array.size(a) > 0
+        array<float> c = array.copy(a)
+        array.sort(c, order.ascending)
+        int n = array.size(c)
+        int h = int(n / 2)
+        m := n % 2 == 1 ? array.get(c, h) : (array.get(c, h - 1) + array.get(c, h)) / 2
+    m
+
+string runName = syminfo.ticker + "_A-" + entryMode + "_B-" + stopMode + "_C-" + tpMode +
+     "_D-" + trendMode + "_M-" + mitigationMode + "_S-" + (sessionFilter ? "on" : "off") +
+     (partialTP ? "_P" : "") + (ifvgMode == "flip" ? "_IFVGflip" : "")
+
+var table t = table.new(position.top_right, 1, 7, border_width = 1)
+
+if showTable and (barstate.islast or barstate.islastconfirmedhistory)
+    float wrT  = strategy.closedtrades > 0 ? float(strategy.wintrades) / strategy.closedtrades * 100 : na
+    float pfT  = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    float netP = strategy.netprofit / strategy.initial_capital * 100
+    float wrE  = nEnt > 0 ? float(nWin) / nEnt * 100 : na
+    float expR = nEnt > 0 ? sumR / nEnt : na
+    float pfR  = glR > 0 ? gpR / glR : na
+    float medR = f_median(rArr)
+    float avgD = nEnt > 0 ? sumDur / nEnt : na
+    float inPos = bar_index > 0 ? float(barsIn) / (bar_index + 1) * 100 : 0.0
+
+    table.cell(t, 0, 0, runName + "   |   " + timeframe.period + "   |   риск " + str.tostring(riskPct, "#.##") + "%",
+         text_color = color.white, bgcolor = color.new(color.navy, 10), text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 0, 1, "тестер: сделок " + str.tostring(strategy.closedtrades) +
+         " | WR " + str.tostring(wrT, "#.#") + "%" +
+         " | PF " + str.tostring(pfT, "#.##") +
+         " | Net " + str.tostring(netP, "#.#") + "%" +
+         " | maxDD(по закрытиям) " + str.tostring(maxDDp, "#.#") + "%" +
+         " | комиссии $" + str.tostring(commPaid, "#"),
+         text_color = color.white, bgcolor = color.new(color.navy, 35), text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 0, 2, "по входам: входов " + str.tostring(nEnt) +
+         " | WR " + str.tostring(wrE, "#.#") + "%" +
+         " | expR " + str.tostring(expR, "#.###") + "R" +
+         " | PF(R) " + str.tostring(pfR, "#.##") +
+         " | медиана " + str.tostring(medR, "#.##") + "R" +
+         " | в сделке " + str.tostring(avgD, "#.#") + " баров" +
+         " | в позиции " + str.tostring(inPos, "#.#") + "% времени",
+         text_color = color.white, bgcolor = color.new(color.navy, 50), text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 0, 3, "зоны: найдено " + str.tostring(cntRaw) +
+         " → размер −" + str.tostring(cntRejSz) +
+         " → displ −" + str.tostring(cntRejDsp) +
+         " → в пул " + str.tostring(cntNew) +
+         " | касаний " + str.tostring(cntTap) +
+         " | до CE " + str.tostring(cntCE),
+         text_color = color.white, bgcolor = color.new(color.navy, 65), text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 0, 4, "уход зон: отработано " + str.tostring(cntFilled) +
+         " | инверсий " + str.tostring(cntInv) +
+         " | флипов " + str.tostring(cntFlip) +
+         " | истекло " + str.tostring(cntExp) +
+         " | живых " + str.tostring(array.size(zones)),
+         text_color = color.white, bgcolor = color.new(color.navy, 65), text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 0, 5, "входы: зон без валидного стопа " + str.tostring(cntNoStop) +
+         " | сессия блокировала " + str.tostring(cntSessB) + " баров" +
+         " | занято позицией " + str.tostring(cntBusyB) + " баров" +
+         " | входов " + str.tostring(cntEnt) +
+         " | частичных " + str.tostring(cntPart),
+         text_color = color.white, bgcolor = color.new(color.navy, 65), text_size = size.small, text_halign = text.align_left)
+    string isTxt = "IS/OOS выключен (вкл. в блоке «Отчёт»)"
+    if useSplit
+        float eIS = nIS > 0 ? sRIS / nIS : na
+        float eOS = nOS > 0 ? sROS / nOS : na
+        float pIS = glIS > 0 ? gpIS / glIS : na
+        float pOS = glOS > 0 ? gpOS / glOS : na
+        float dPF = not na(pIS) and not na(pOS) and pIS > 0 ? math.abs(pOS - pIS) / pIS * 100 : na
+        isTxt := "IS до " + str.format_time(splitTime, "yyyy-MM-dd", "UTC") +
+             ": N " + str.tostring(nIS) + " WR " + str.tostring(nIS > 0 ? float(wIS) / nIS * 100 : na, "#.#") +
+             "% PF(R) " + str.tostring(pIS, "#.##") + " expR " + str.tostring(eIS, "#.###") +
+             "   ||   OOS: N " + str.tostring(nOS) + " WR " + str.tostring(nOS > 0 ? float(wOS) / nOS * 100 : na, "#.#") +
+             "% PF(R) " + str.tostring(pOS, "#.##") + " expR " + str.tostring(eOS, "#.###") +
+             "   ||   расхождение PF " + str.tostring(dPF, "#.#") + "%"
+    table.cell(t, 0, 6, isTxt,
+         text_color = color.white, bgcolor = color.new(color.navy, 80), text_size = size.small, text_halign = text.align_left)
