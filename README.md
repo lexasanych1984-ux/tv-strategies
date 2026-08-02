@@ -22,7 +22,10 @@ fx-indices/   боевые FX/индексные скрипты (SMC, Asia Sweep
 > стратегий поэтому **консервативны**: реальные издержки ниже заявленных.
 > Пересчёт под пер-инструментные профили в скоуп не входит (решение 02.08.2026).
 > Измерение и предложение по профилям —
-> [fvg-1h-trend/docs/cost-profiles-proposal-2026-08-02.md](fvg-1h-trend/docs/cost-profiles-proposal-2026-08-02.md).
+> [fvg-1h-trend/docs/cost-profiles-proposal-2026-08-02.md](fvg-1h-trend/docs/cost-profiles-proposal-2026-08-02.md)
+> (механика `cash_per_contract` утверждена, цифры круга — черновые под демо Just2Trade MT5;
+> в правила репозитория профили пока НЕ внесены). Черновой перепрогон под ними —
+> [fvg-1h-trend/docs/draft-cost-rerun-2026-08-02.md](fvg-1h-trend/docs/draft-cost-rerun-2026-08-02.md).
 
 ---
 
