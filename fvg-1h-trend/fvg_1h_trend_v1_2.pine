@@ -854,7 +854,7 @@ if showTable and (barstate.islast or barstate.islastconfirmedhistory)
     float ratio  = not na(mSide) and not na(eSide) and eSide > 0 ? mSide / eSide : na
     bool  noProf = costModel == "cash_per_contract" and costRT <= 0
     bool  mism   = not na(ratio) and (ratio < 0.9 or ratio > 1.1)
-    string cTxt = "профиль издержек (ЧЕРНОВИК Just2Trade): " + costModel +
+    string cTxt = "профиль издержек (Just2Trade, замер 03.08.2026): " + costModel +
          (noProf ? " | круг на этот тикер НЕ ЗАДАН (инпут «Прочие тикеры» = 0)" :
               " | круг заявлен " + str.tostring(costModel == "percent" ? costPct : costRT, "#.########") +
               (costModel == "percent" ? " % за сторону" : " в цене") +
