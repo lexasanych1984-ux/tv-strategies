@@ -28,7 +28,7 @@ fx-indices/   — FX и индексы
   - **крипта** — `commission_type = strategy.commission.percent`, `commission_value = 0.055`;
   - **FX и индексы** — `commission_type = strategy.commission.cash_per_contract`,
     `commission_value` = половина стоимости круга, выраженной в единицах цены;
-  - `slippage = 2` во всех профилях.
+  - `slippage = 3` тика; для **GBPJPY — 5** (волатильность, широкие тени).
 
   Процент от номинала на FX/индексах **запрещён**: он завышает круг примерно вдесятеро на FX
   и в 20–30 раз на индексах, потому что считается от номинала, а стоп меряется дистанцией.
