@@ -1,0 +1,185 @@
+//@version=6
+indicator("Сессии EET + Уровни открытий", "Сессии", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ── Общие ─────────────────────────────────────────────────────
+grpG = "Общие"
+mode    = input.string("Форекс", "Режим", options = ["Форекс", "Индексы США"], group = grpG,
+     tooltip = "Форекс: Азия / Франкфурт / Лондон / Лондон+NY + ланч. Индексы США: ETH / RTH / IB.")
+boxTr   = input.int(82, "Прозрачность заливки сессий, %", minval = 0, maxval = 100, group = grpG)
+showLbl = input.bool(true, "Подписи сессий", group = grpG)
+tzEU    = input.string("Europe/Kiev", "Часовой пояс EET (автоперевод)", group = grpG)
+tzUS    = input.string("America/New_York", "Часовой пояс США (автоперевод)", group = grpG)
+
+// ── Форекс (время EET, летом UTC+3) ───────────────────────────
+grpF = "Форекс — время EET"
+onA  = input.bool(true, "", inline = "a", group = grpF)
+colA = input.color(#b0bec5, "Азия", inline = "a", group = grpF)
+sesA = input.session("0000-0900", "", inline = "a", group = grpF)
+
+onF  = input.bool(true, "", inline = "f", group = grpF)
+colF = input.color(#ffcc80, "Франкфурт", inline = "f", group = grpF)
+sesF = input.session("0900-1000", "", inline = "f", group = grpF)
+
+onL  = input.bool(true, "", inline = "l", group = grpF)
+colL = input.color(#90caf9, "Лондон", inline = "l", group = grpF)
+sesL = input.session("1000-1400", "", inline = "l", group = grpF)
+
+onX  = input.bool(true, "", inline = "x", group = grpF)
+colX = input.color(#a5d6a7, "Лондон+NY", inline = "x", group = grpF)
+sesX = input.session("1400-1900", "", inline = "x", group = grpF)
+
+onLu  = input.bool(true, "", inline = "u", group = grpF)
+colLu = input.color(#bcaaa4, "Ланч Лондон", inline = "u", group = grpF)
+sesLu = input.session("1200-1400", "", inline = "u", group = grpF)
+
+// ── Индексы США (время Нью-Йорка) ─────────────────────────────
+grpU = "Индексы США — время Нью-Йорка"
+onE  = input.bool(true, "", inline = "e", group = grpU)
+colE = input.color(#b0bec5, "ETH (овернайт)", inline = "e", group = grpU)
+sesE = input.session("1800-0930", "", inline = "e", group = grpU)
+
+onR  = input.bool(true, "", inline = "r", group = grpU)
+colR = input.color(#a5d6a7, "RTH (осн. сессия)", inline = "r", group = grpU)
+sesR = input.session("0930-1600", "", inline = "r", group = grpU)
+
+onI  = input.bool(true, "", inline = "i", group = grpU)
+colI = input.color(#ffb74d, "IB (Initial Balance)", inline = "i", group = grpU)
+sesI = input.session("0930-1000", "", inline = "i", group = grpU)
+
+// ── Уровни открытий ───────────────────────────────────────────
+grpO = "Уровни открытий"
+onPD  = input.bool(true, "", inline = "pd", group = grpO)
+colPD = input.color(#26c6da, "PDH / PDL — экстремумы прошлого дня", inline = "pd", group = grpO)
+onDO  = input.bool(true, "", inline = "do", group = grpO)
+colDO = input.color(#787b86, "DO — открытие дня", inline = "do", group = grpO)
+onWO  = input.bool(true, "", inline = "wo", group = grpO)
+colWO = input.color(#64b5f6, "WO — открытие недели", inline = "wo", group = grpO)
+onMO  = input.bool(true, "", inline = "mo", group = grpO)
+colMO = input.color(#ce93d8, "MO — открытие месяца", inline = "mo", group = grpO)
+
+// ── Логика сессий ─────────────────────────────────────────────
+sesShow = timeframe.isintraday and timeframe.in_seconds() <= 3600
+opnShow = timeframe.isintraday
+fxMode  = mode == "Форекс"
+usMode  = mode == "Индексы США"
+
+inSes(ses, tz) =>
+    not na(time(timeframe.period, ses, tz))
+
+inA  = inSes(sesA,  tzEU)
+inF  = inSes(sesF,  tzEU)
+inL  = inSes(sesL,  tzEU)
+inX  = inSes(sesX,  tzEU)
+inLu = inSes(sesLu, tzEU)
+inE  = inSes(sesE,  tzUS)
+inR  = inSes(sesR,  tzUS)
+inI  = inSes(sesI,  tzUS)
+
+f_box(active, isOn, col, txt) =>
+    var box b    = na
+    var label lb = na
+    st = active and not active[1]
+    if sesShow and isOn and st
+        b := box.new(bar_index, high, bar_index + 1, low, border_color = color.new(col, 100), bgcolor = color.new(col, boxTr))
+        lb := showLbl ? label.new(bar_index, high, txt, style = label.style_label_down, color = color.new(col, 100), textcolor = color.new(col, 10), size = size.small) : label(na)
+    if sesShow and isOn and active and not st and not na(b)
+        box.set_right(b, bar_index + 1)
+        box.set_top(b, math.max(box.get_top(b), high))
+        box.set_bottom(b, math.min(box.get_bottom(b), low))
+        if showLbl and not na(lb)
+            label.set_y(lb, box.get_top(b))
+
+f_box(inA,  fxMode and onA,  colA,  "Азия")
+f_box(inF,  fxMode and onF,  colF,  "Франкфурт")
+f_box(inL,  fxMode and onL,  colL,  "Лондон")
+f_box(inX,  fxMode and onX,  colX,  "Лондон+NY")
+f_box(inLu, fxMode and onLu, colLu, "Ланч")
+f_box(inE,  usMode and onE,  colE,  "ETH")
+f_box(inR,  usMode and onR,  colR,  "RTH")
+f_box(inI,  usMode and onI,  colI,  "IB")
+
+// ── Уровни открытий: PDH/PDL, DO, WO, MO ──────────────────────
+newD = timeframe.change("D")
+newW = timeframe.change("W")
+newM = timeframe.change("M")
+
+rOff = 10  // отступ линий вправо от последней свечи, баров
+
+var float curH  = na
+var float curL  = na
+var int   curHb = na
+var int   curLb = na
+
+var line  lnPDH = na
+var line  lnPDL = na
+var line  lnDO  = na
+var line  lnWO  = na
+var line  lnMO  = na
+var label lbPDH = na
+var label lbPDL = na
+var label lbDO  = na
+var label lbWO  = na
+var label lbMO  = na
+
+if opnShow and newD
+    pdh  = curH
+    pdl  = curL
+    pdhB = curHb
+    pdlB = curLb
+    curH  := high
+    curL  := low
+    curHb := bar_index
+    curLb := bar_index
+    if onPD and not na(pdh)
+        line.delete(lnPDH)
+        lnPDH := line.new(pdhB, pdh, bar_index + rOff, pdh, color = colPD, style = line.style_dashed)
+        label.delete(lbPDH)
+        lbPDH := label.new(bar_index + rOff, pdh, "PDH", style = label.style_none, textcolor = colPD, size = size.small)
+    if onPD and not na(pdl)
+        line.delete(lnPDL)
+        lnPDL := line.new(pdlB, pdl, bar_index + rOff, pdl, color = colPD, style = line.style_dashed)
+        label.delete(lbPDL)
+        lbPDL := label.new(bar_index + rOff, pdl, "PDL", style = label.style_none, textcolor = colPD, size = size.small)
+    if onDO
+        line.delete(lnDO)
+        lnDO := line.new(bar_index, open, bar_index + rOff, open, color = colDO)
+        label.delete(lbDO)
+        lbDO := label.new(bar_index + rOff, open, "DO", style = label.style_none, textcolor = colDO, size = size.small)
+
+if opnShow and not newD
+    if na(curH) or high > curH
+        curH  := high
+        curHb := bar_index
+    if na(curL) or low < curL
+        curL  := low
+        curLb := bar_index
+
+if opnShow and newW and onWO
+    line.delete(lnWO)
+    lnWO := line.new(bar_index, open, bar_index + rOff, open, color = colWO)
+    label.delete(lbWO)
+    lbWO := label.new(bar_index + rOff, open, "WO", style = label.style_none, textcolor = colWO, size = size.small)
+
+if opnShow and newM and onMO
+    line.delete(lnMO)
+    lnMO := line.new(bar_index, open, bar_index + rOff, open, color = colMO)
+    label.delete(lbMO)
+    lbMO := label.new(bar_index + rOff, open, "MO", style = label.style_none, textcolor = colMO, size = size.small)
+
+// Правый край линий и подписи двигаются за последней свечой
+if barstate.islast
+    if not na(lnPDH)
+        line.set_x2(lnPDH, bar_index + rOff)
+        label.set_x(lbPDH, bar_index + rOff + 2)
+    if not na(lnPDL)
+        line.set_x2(lnPDL, bar_index + rOff)
+        label.set_x(lbPDL, bar_index + rOff + 2)
+    if not na(lnDO)
+        line.set_x2(lnDO, bar_index + rOff)
+        label.set_x(lbDO, bar_index + rOff + 2)
+    if not na(lnWO)
+        line.set_x2(lnWO, bar_index + rOff)
+        label.set_x(lbWO, bar_index + rOff + 2)
+    if not na(lnMO)
+        line.set_x2(lnMO, bar_index + rOff)
+        label.set_x(lbMO, bar_index + rOff + 2)
